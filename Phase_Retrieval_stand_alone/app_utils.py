@@ -1284,6 +1284,63 @@ def load_training_data_metadata(td_folder: str):
     return {"param_dict": param_dict, "labels": labels}
 
 
+_TRAINING_DATA_LABEL_METADATA_KEYS = {
+    'volume_size', 'us_factor', 'blob_r', 'blob_maxv', 'tile_grid', 'camera_size_px',
+}
+
+
+def check_training_data_folder(td_folder: str, meta: dict) -> list:
+    """Minimal sanity checks that td_folder's actual on-disk files match what its own
+    param.pickle/y.pickle claim -- catches a folder copied/moved from a different run (wrong
+    image size), pointed at the wrong path, or only partially transferred (missing frames),
+    with a clear message instead of an opaque failure deep inside the DataLoader once training
+    starts. Cheap by design (a set comparison over filenames + reading exactly one sample
+    image), not a full per-file validation. Returns a list of warning strings; empty means
+    nothing suspicious was found. Never raises -- a failure here should not block loading,
+    only warn."""
+    warnings = []
+    labels = meta['labels']
+    x_dir = os.path.join(td_folder, 'x')
+
+    try:
+        entries = os.listdir(x_dir)
+    except OSError as exc:
+        return [f"Could not list {x_dir}: {exc}"]
+
+    tif_files = sorted(f for f in entries if f.lower().endswith(('.tif', '.tiff')))
+    other_files = [f for f in entries if os.path.isfile(os.path.join(x_dir, f))
+                   and not f.lower().endswith(('.tif', '.tiff'))]
+    if other_files:
+        warnings.append(f"{len(other_files)} non-TIFF file(s) in x/ (e.g. '{other_files[0]}') -- ignored.")
+
+    expected_frames = set(labels.keys()) - _TRAINING_DATA_LABEL_METADATA_KEYS
+    on_disk = set(tif_files)
+    missing = expected_frames - on_disk
+    extra = on_disk - expected_frames
+    if missing:
+        sample = ', '.join(sorted(missing)[:3])
+        warnings.append(f"{len(missing)} frame(s) listed in y.pickle are missing from x/ (e.g. {sample}).")
+    if extra:
+        sample = ', '.join(sorted(extra)[:3])
+        warnings.append(f"{len(extra)} .tif file(s) in x/ have no matching entry in y.pickle (e.g. {sample}) -- ignored.")
+
+    if tif_files:
+        sample_name = tif_files[0]
+        try:
+            sample_im = io.imread(os.path.join(x_dir, sample_name))
+        except Exception as exc:
+            warnings.append(f"Could not read '{sample_name}' to check its size: {exc}")
+        else:
+            expected_hw = labels.get('camera_size_px')
+            if expected_hw is not None and tuple(sample_im.shape) != tuple(expected_hw):
+                warnings.append(
+                    f"Image size mismatch: '{sample_name}' is {tuple(sample_im.shape)}, but "
+                    f"y.pickle's camera_size_px is {tuple(expected_hw)}."
+                )
+
+    return warnings
+
+
 def _make_post_epoch_fn(live_box, validate_ds, param_dict, t0, sample_viz_every_epochs):
     """Builds the per-epoch callback passed as Trainer.fit(post_epoch_fn=...). Tracks loss/LR
     history and, every sample_viz_every_epochs epochs (or on a new best), renders a fixed

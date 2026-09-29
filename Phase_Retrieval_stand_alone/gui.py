@@ -1963,11 +1963,19 @@ def build_demo() -> gr.Blocks:
             except Exception as exc:
                 return None, f"[ERROR] Could not load training data: {exc}"
             if meta is None:
-                return None, ("No training data found yet at this path — run Generate Training "
-                               "Data first, or check the folder path.")
-            n_frames = len(meta["labels"]) - 6  # labels dict also holds ~6 metadata keys, not frames
+                return None, ("No training data found yet at this path — point this at any "
+                               "folder generate_training_data() has written to (a previous run's "
+                               "output is fine, not just the one just generated in this session), "
+                               "or run Generate Training Data first.")
+            n_frames = len(meta["labels"]) - len(app_utils._TRAINING_DATA_LABEL_METADATA_KEYS)
             D, HH, WW = meta["labels"]["volume_size"]
             status = f"Loaded {max(n_frames, 0)} frame(s). Volume size (D,H,W) = ({D},{HH},{WW})."
+            try:
+                data_warnings = app_utils.check_training_data_folder(str(training_data_dir), meta)
+            except Exception as exc:
+                data_warnings = [f"(sanity checks themselves failed, ignoring: {exc})"]
+            if data_warnings:
+                status += " ⚠ " + " ".join(data_warnings)
             return meta, status
 
         def on_train_start(td_meta, *vals):
