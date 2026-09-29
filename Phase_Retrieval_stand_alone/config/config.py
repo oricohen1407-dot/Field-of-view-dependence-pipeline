@@ -106,10 +106,34 @@ class TrainingDataConfig:
 
 
 @dataclass
+class TrainingRunConfig:
+    # --- Critical ---
+    training_data_dir: str = ""      # GUI default set at build time: PROJECT_DIR / "training_data"
+    checkpoint_dir: str = ""         # GUI default set at build time: PROJECT_DIR / "training_results"
+    device: str = "auto"             # "auto" | "cpu" | "cuda:N"
+    resume_checkpoint: Optional[str] = None   # filename inside checkpoint_dir, or None = fresh start
+    num_epochs: int = 30             # root's default (func_utils.py func5)
+
+    # --- Advanced (defaults = root's exact hardcoded values, for faithful parity) ---
+    batch_size: int = 32
+    learning_rate: float = 0.005
+    early_stopping_patience: int = 15
+    train_val_split: float = 0.9
+    shuffle_train_val_split: bool = False   # False = root's exact (non-shuffled) behavior
+    num_workers: int = 0                    # root uses 8; lower default -- see config.py module notes
+    numpy_seed: int = 66                    # root: np.random.seed(66)
+    torch_seed: int = 88                    # root: torch.manual_seed(88)
+    sample_viz_every_epochs: int = 5        # GUI-only: cadence of the sample-prediction debug panel
+    viz_threshold: float = 20.0             # GUI-only: Volume2XYZ decode threshold for the debug
+                                             # panel only -- never affects the training loss
+
+
+@dataclass
 class Config:
     user: UserConfig = field(default_factory=UserConfig)
     advanced: AdvancedConfig = field(default_factory=AdvancedConfig)
     training: TrainingDataConfig = field(default_factory=TrainingDataConfig)
+    training_run: TrainingRunConfig = field(default_factory=TrainingRunConfig)
 
     def generate_param_dict(self) -> dict:
         """
@@ -197,6 +221,33 @@ class Config:
             'noise_offset_range': tuple(float(x) for x in t.noise_offset_range.split(',')),
         }
 
+    def generate_training_run_dict(self, td_metadata: dict) -> tuple[dict, dict]:
+        """
+        td_metadata: the dict returned by app_utils.load_training_data_metadata(), i.e.
+        {'param_dict': <param.pickle contents>, 'labels': <y.pickle contents>}.
+        Returns (param_dict, training_dict), mirroring root's training_func()'s own two-dict
+        convention: param_dict carries physics/IO fields (MyDataset/LON/KDE_loss3D/Volume2XYZ),
+        training_dict carries the run's hyperparameters.
+        """
+        from DS3Dplus.ds3d_utils import select_device
+
+        r = self.training_run
+        param_dict = dict(td_metadata['param_dict'])   # copy -- never mutate the cached metadata
+        param_dict['td_folder'] = r.training_data_dir
+        param_dict['path_save'] = r.checkpoint_dir
+        param_dict['device'] = select_device() if r.device == "auto" else r.device
+        param_dict['threshold'] = r.viz_threshold        # debug panel only, not the loss
+        training_dict = dict(
+            batch_size=r.batch_size, lr=r.learning_rate, num_epochs=r.num_epochs,
+            resume_net_file=r.resume_checkpoint or None,
+            early_stopping=r.early_stopping_patience,
+            train_val_split=r.train_val_split, shuffle_split=r.shuffle_train_val_split,
+            num_workers=r.num_workers,
+            numpy_seed=r.numpy_seed, torch_seed=r.torch_seed,
+            sample_viz_every_epochs=r.sample_viz_every_epochs,
+        )
+        return param_dict, training_dict
+
     def generate_pr_dict(self) -> dict:
         """
         Phase retrieval training configuration consumed only by phase_retrieval().
@@ -232,13 +283,16 @@ class Config:
         user_fields = {f.name for f in dataclass_fields(UserConfig) if f.init}
         adv_fields = {f.name for f in dataclass_fields(AdvancedConfig) if f.init}
         training_fields = {f.name for f in dataclass_fields(TrainingDataConfig) if f.init}
+        training_run_fields = {f.name for f in dataclass_fields(TrainingRunConfig) if f.init}
         user_kwargs = {k: v for k, v in d['user'].items() if k in user_fields}
         adv_kwargs = {k: v for k, v in d['advanced'].items() if k in adv_fields}
         training_kwargs = {k: v for k, v in d.get('training', {}).items() if k in training_fields}
+        training_run_kwargs = {k: v for k, v in d.get('training_run', {}).items() if k in training_run_fields}
         return cls(
             user=UserConfig(**user_kwargs),
             advanced=AdvancedConfig(**adv_kwargs),
             training=TrainingDataConfig(**training_kwargs),
+            training_run=TrainingRunConfig(**training_run_kwargs),
         )
 
     def save(self, path: str):

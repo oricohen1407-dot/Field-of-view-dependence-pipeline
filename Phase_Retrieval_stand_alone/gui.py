@@ -15,10 +15,11 @@ from pathlib import Path
 import gradio as gr
 import numpy as np
 import tifffile
+import torch
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-from config.config import Config, UserConfig, AdvancedConfig, TrainingDataConfig
+from config.config import Config, UserConfig, AdvancedConfig, TrainingDataConfig, TrainingRunConfig
 from config.emitter_centers import (
     PROJECT_DIR as DATA_ROOT_DIR, ZSTACK_FILES_PATH,
     ZSTACK_FILE, CENTRAL_BEAD_COORDINATES_PIXEL, OFFAXIS_ZSTACK_FILES, OFFAXIS_COORDS_PIXEL,
@@ -36,6 +37,14 @@ CALIBRATION_EMITTERS_DIR = PROJECT_DIR / "calibration_setup_emitters"
 # phase_retrieval() (app_utils.py) hardcodes this exact path for its per-bead exp/sim outputs —
 # not configurable via pr_dict/param_dict, so this constant must track that literal default.
 RESULTS_DIR = PROJECT_DIR / "phase_retrieval_outputs"
+# Same Gradio-temp-path gotcha as CALIBRATION_EMITTERS_DIR above, hitting "Calibration folder"
+# mode too: gr.File(file_count="directory") uploads each file into its OWN per-file hash
+# subdirectory (AppData\Local\Temp\gradio\<hash>\<filename>), not one shared folder — so
+# os.path.commonpath() across the uploaded paths collapses to their shared ancestor (just
+# ...\Temp\gradio), one level above where any actual file lives. Resolving project_dir/filename
+# against that then 404s. Fix: copy the uploaded files into one real, stable folder here instead
+# of trying to reuse Gradio's own scattered temp layout as project_dir.
+CALIBRATION_FOLDER_IMPORTS_DIR = PROJECT_DIR / "calibration_folder_imports"
 
 MICROSCOPE_FIELDS = ["M", "NA", "n_immersion", "f_4f", "ps_camera", "ps_BFP", "n_sample", "bitdepth"]
 
@@ -47,6 +56,22 @@ def _make_emitters_out_dir(raw_stem: str) -> str:
     into a shared folder."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return str(CALIBRATION_EMITTERS_DIR / f"{raw_stem}_{timestamp}_emitters")
+
+
+def _import_calib_folder(tif_paths: list) -> str:
+    """Copies each uploaded calibration TIFF (each sitting in its own Gradio temp-upload
+    subdirectory) into one fresh, real, flat folder under CALIBRATION_FOLDER_IMPORTS_DIR, and
+    returns that folder's path. This is the "Calibration folder" analog of
+    _make_emitters_out_dir — one real place the rest of the app can treat as project_dir,
+    instead of trying to reconstruct a shared folder out of Gradio's own scattered per-file
+    temp layout."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = CALIBRATION_FOLDER_IMPORTS_DIR / timestamp
+    os.makedirs(out_dir, exist_ok=True)
+    for p in tif_paths:
+        shutil.copy2(p, out_dir / os.path.basename(p))
+    return str(out_dir)
+
 
 CRITICAL_CSS = """
 .critical-config {
@@ -301,6 +326,91 @@ def _build_live_figure(live_box: dict):
     return fig
 
 
+def _fmt_hms(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _build_train_live_figure(live_box: dict):
+    """Build the Train Model tab's live monitor from app_utils._make_post_epoch_fn's latest
+    snapshot: train/val loss curves + LR on top, epoch/ETA/early-stopping status as text, and a
+    fixed validation tile's predicted-vs-ground-truth max-projection (+ Jaccard/RMSE, if the
+    best-effort Volume2XYZ decode succeeded) on the bottom. Same object-oriented Figure +
+    FigureCanvasAgg convention as _build_live_figure (no bare pyplot — this runs on the GUI
+    polling thread while the training worker thread runs concurrently)."""
+    train_hist = live_box.get('train_loss_history')
+    if train_hist is None:
+        return None
+    test_hist = live_box.get('test_loss_history', [])
+    lr_hist = live_box.get('lr_history', [])
+    epoch = live_box.get('epoch', 0)
+    total_epochs = live_box.get('total_epochs', 0)
+    best_metric = live_box.get('best_metric')
+    epochs_without_improvement = live_box.get('epochs_without_improvement', 0)
+
+    fig = Figure(figsize=(11, 7), constrained_layout=True)
+    FigureCanvasAgg(fig)
+    subfig_top, subfig_bottom = fig.subfigures(2, 1, height_ratios=[1, 1.3])
+
+    ax_loss, ax_lr, ax_info = subfig_top.subplots(1, 3)
+    x = list(range(1, len(train_hist) + 1))
+    ax_loss.plot(x, train_hist, label="train")
+    ax_loss.plot(x, test_hist, label="val")
+    if best_metric is not None and test_hist:
+        best_epoch = int(np.argmin(test_hist)) + 1
+        ax_loss.axvline(best_epoch, color="gray", linestyle="--", linewidth=1)
+    ax_loss.set_yscale("log")
+    ax_loss.set_xlabel("epoch")
+    cur_test = test_hist[-1] if test_hist else float('nan')
+    ax_loss.set_title(f"best={best_metric:.4g} | current={cur_test:.4g}" if best_metric is not None
+                       else f"current={cur_test:.4g}", fontsize=9)
+    ax_loss.legend(fontsize=8)
+
+    ax_lr.plot(x, lr_hist, color="tab:purple", drawstyle="steps-post")
+    ax_lr.set_yscale("log")
+    ax_lr.set_xlabel("epoch")
+    ax_lr.set_title(f"lr={lr_hist[-1]:.2g}" if lr_hist else "lr", fontsize=9)
+
+    ax_info.axis("off")
+    early_stop = live_box.get('early_stopping_patience')
+    info_lines = [
+        f"epoch {epoch} / {total_epochs}",
+        f"elapsed {_fmt_hms(live_box.get('elapsed_s', 0))}",
+        f"ETA {_fmt_hms(live_box.get('eta_s', 0))}",
+    ]
+    if early_stop:
+        info_lines.append(f"no improvement: {epochs_without_improvement} / {early_stop}")
+    else:
+        info_lines.append(f"no improvement: {epochs_without_improvement}")
+    ax_info.text(0.0, 0.5, "\n".join(info_lines), fontsize=10, va="center", family="monospace")
+
+    ax_pred, ax_tgt = subfig_bottom.subplots(1, 2)
+    pred_proj = live_box.get('pred_proj')
+    target_proj = live_box.get('target_proj')
+    if pred_proj is not None and target_proj is not None:
+        ax_pred.imshow(pred_proj, cmap="gray")
+        ax_tgt.imshow(target_proj, cmap="gray")
+    ax_pred.set_title(f"predicted (max-z proj, epoch {live_box.get('viz_epoch', '?')})", fontsize=9)
+    ax_tgt.set_title("ground truth (max-z proj)", fontsize=9)
+    ax_pred.set_xticks([]); ax_pred.set_yticks([])
+    ax_tgt.set_xticks([]); ax_tgt.set_yticks([])
+
+    jacc = live_box.get('sample_jaccard')
+    if jacc is not None:
+        rmse_xy = live_box.get('sample_rmse_xy')
+        rmse_z = live_box.get('sample_rmse_z')
+        parts = [f"jaccard={jacc:.2f}"]
+        if rmse_xy is not None:
+            parts.append(f"RMSE_xy={rmse_xy * 1000:.1f}nm")
+        if rmse_z is not None:
+            parts.append(f"RMSE_z={rmse_z * 1000:.1f}nm")
+        subfig_bottom.suptitle(" | ".join(parts), fontsize=9)
+
+    return fig
+
+
 # ── Calibration Setup helpers (click-to-crop emitter picker) ──────────────────
 
 _COORD_RE = re.compile(r"_x(\d+)_y(\d+)")
@@ -517,8 +627,8 @@ def _opt_str(v):
 
 
 def config_to_fields(cfg: Config) -> list:
-    """Flatten a Config into the ordered list of Gradio field values (63 items)."""
-    u, a, t = cfg.user, cfg.advanced, cfg.training
+    """Flatten a Config into the ordered list of Gradio field values (78 items)."""
+    u, a, t, tr = cfg.user, cfg.advanced, cfg.training, cfg.training_run
     sig_lo, sig_hi = (float(x) for x in t.signal_range.split(','))
     bg_lo, bg_hi = (float(x) for x in t.background_range.split(','))
     dens_lo, dens_hi = (float(x) for x in t.density_range.split(','))
@@ -569,6 +679,13 @@ def config_to_fields(cfg: Config) -> list:
         t.num_z_voxel, t.us_factor,
         t.blob_r, t.blob_sigma, t.blob_maxv,
         noff_lo, noff_hi,
+        # ── Train Model — appended, keeps every index above stable ──────────────
+        tr.training_data_dir, tr.checkpoint_dir, tr.device,
+        tr.resume_checkpoint or "",
+        tr.num_epochs,
+        tr.batch_size, tr.learning_rate, tr.early_stopping_patience,
+        tr.train_val_split, tr.shuffle_train_val_split, tr.num_workers,
+        tr.numpy_seed, tr.torch_seed, tr.sample_viz_every_epochs, tr.viz_threshold,
     ]
 
 
@@ -605,6 +722,10 @@ def fields_to_config(
     td_num_z_voxel, td_us_factor,
     td_blob_r, td_blob_sigma, td_blob_maxv,
     td_noise_off_min, td_noise_off_max,
+    # Train Model (15)
+    train_data_dir, train_ckpt_dir, train_device, train_resume_ckpt, train_num_epochs,
+    train_batch_size, train_lr, train_early_stopping, train_val_split, train_shuffle_split,
+    train_num_workers, train_numpy_seed, train_torch_seed, train_sample_viz_every, train_viz_threshold,
 ) -> Config:
     """Parse ordered Gradio field values back into a Config object."""
     offaxis_files = [
@@ -670,6 +791,23 @@ def fields_to_config(
             blob_sigma=float(td_blob_sigma),
             blob_maxv=int(float(td_blob_maxv)),
             noise_offset_range=f"{float(td_noise_off_min)}, {float(td_noise_off_max)}",
+        ),
+        training_run=TrainingRunConfig(
+            training_data_dir=str(train_data_dir).strip(),
+            checkpoint_dir=str(train_ckpt_dir).strip(),
+            device=str(train_device),
+            resume_checkpoint=_opt_str(train_resume_ckpt),
+            num_epochs=int(float(train_num_epochs)),
+            batch_size=int(float(train_batch_size)),
+            learning_rate=float(train_lr),
+            early_stopping_patience=int(float(train_early_stopping)),
+            train_val_split=float(train_val_split),
+            shuffle_train_val_split=bool(train_shuffle_split),
+            num_workers=int(float(train_num_workers)),
+            numpy_seed=int(float(train_numpy_seed)),
+            torch_seed=int(float(train_torch_seed)),
+            sample_viz_every_epochs=int(float(train_sample_viz_every)),
+            viz_threshold=float(train_viz_threshold),
         ),
     )
 
@@ -1018,6 +1156,65 @@ def build_demo() -> gr.Blocks:
                     td_stop_btn = gr.Button("Stop", variant="stop", interactive=False)
                 td_log_out = gr.Textbox(label="Output Log", lines=15, interactive=False)
 
+            with gr.Tab("Train Model"):
+                gr.Markdown("### 1. Load Training Data")
+                with gr.Row(equal_height=True):
+                    train_load_td_btn = gr.Button("Load Training Data")
+                    train_td_status = gr.Textbox(
+                        show_label=False, interactive=False,
+                        placeholder="Click to load x/, y.pickle, param.pickle from the training-data folder below.",
+                    )
+                train_td_meta_state = gr.State(None)
+
+                gr.Markdown("### 2. Configure")
+                with gr.Group(elem_classes=["critical-config"]):
+                    with gr.Row(equal_height=True):
+                        train_data_dir = gr.Textbox(
+                            label="Training data folder",
+                            value=defaults[63] or str(PROJECT_DIR / "training_data"),
+                        )
+                        train_ckpt_dir = gr.Textbox(
+                            label="Checkpoint output folder",
+                            value=defaults[64] or str(PROJECT_DIR / "training_results"),
+                        )
+                    with gr.Row(equal_height=True):
+                        train_device = gr.Dropdown(
+                            label="Device", choices=["auto", "cpu"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())],
+                            value=defaults[65],
+                        )
+                        train_resume_ckpt = gr.Textbox(
+                            label="Resume from checkpoint (filename, empty = fresh run)", value=defaults[66],
+                        )
+                        train_num_epochs = gr.Number(label="Number of epochs", value=defaults[67], precision=0)
+
+                with gr.Accordion("Advanced", open=False):
+                    with gr.Row(equal_height=True):
+                        train_batch_size = gr.Number(label="Batch size", value=defaults[68], precision=0)
+                        train_lr = gr.Number(label="Learning rate", value=defaults[69])
+                        train_early_stopping = gr.Number(label="Early stopping patience (epochs)", value=defaults[70], precision=0)
+                    with gr.Row(equal_height=True):
+                        train_val_split = gr.Number(label="Train/val split (train fraction)", value=defaults[71])
+                        train_shuffle_split = gr.Checkbox(label="Shuffle before train/val split", value=defaults[72])
+                        train_num_workers = gr.Number(label="DataLoader num_workers", value=defaults[73], precision=0)
+                    with gr.Row(equal_height=True):
+                        train_numpy_seed = gr.Number(label="NumPy seed", value=defaults[74], precision=0)
+                        train_torch_seed = gr.Number(label="Torch seed", value=defaults[75], precision=0)
+                    with gr.Row(equal_height=True):
+                        train_sample_viz_every = gr.Number(label="Sample-viz cadence (epochs)", value=defaults[76], precision=0)
+                        train_viz_threshold = gr.Number(label="Viz decode threshold", value=defaults[77])
+
+                with gr.Row(equal_height=True):
+                    train_start_btn = gr.Button("Train Model", variant="primary")
+                    train_stop_btn = gr.Button("Stop", variant="stop", interactive=False)
+
+                gr.Markdown("**Live training monitor**")
+                train_live_plot = gr.Plot(show_label=False)
+                train_summary = gr.Textbox(
+                    show_label=False, interactive=False,
+                    placeholder="Best/last checkpoint paths appear here once training finishes.",
+                )
+                train_log_out = gr.Textbox(label="Output Log", lines=15, interactive=False)
+
         # component list — order MUST match config_to_fields / fields_to_config
         all_fields = [
             m_M, m_NA, m_n_imm, u_lamda, m_n_sample,
@@ -1043,6 +1240,9 @@ def build_demo() -> gr.Blocks:
             td_num_z_voxel, td_us_factor,
             td_blob_r, td_blob_sigma, td_blob_maxv,
             td_noise_off_min, td_noise_off_max,
+            train_data_dir, train_ckpt_dir, train_device, train_resume_ckpt, train_num_epochs,
+            train_batch_size, train_lr, train_early_stopping, train_val_split, train_shuffle_split,
+            train_num_workers, train_numpy_seed, train_torch_seed, train_sample_viz_every, train_viz_threshold,
         ]
 
         # microscope preset fields, in the fixed order used by microscopes.json entries
@@ -1055,6 +1255,10 @@ def build_demo() -> gr.Blocks:
         # separate from _run_state above so the Run tab's PSF-characterization run and this
         # tab's training-data generation run never share a stop button / busy flag.
         _td_run_state = {"stop_event": None, "busy": False}
+        # separate again for Train Model — all three worker threads redirect the process-global
+        # sys.stdout, so all three busy flags must be cross-checked by every one of the three
+        # run-starting handlers (see the guards in run_handler, on_td_simulate, on_train_start).
+        _train_run_state = {"stop_event": None, "busy": False}
 
         # ── Handlers ─────────────────────────────────────────────────────────
 
@@ -1078,37 +1282,63 @@ def build_demo() -> gr.Blocks:
             tif_paths = [f for f in file_paths if str(f).lower().endswith((".tif", ".tiff"))]
             if not tif_paths:
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip(), "No .tif files found in the selected folder."
-            folder = os.path.commonpath(tif_paths)
+            # Copy into one real folder rather than os.path.commonpath(tif_paths) -- Gradio
+            # uploads each file into its OWN per-file temp subdirectory for file_count="directory",
+            # so the common path is just their shared temp-root ancestor, not a folder any of the
+            # files actually live in (see CALIBRATION_FOLDER_IMPORTS_DIR's comment above).
+            folder = _import_calib_folder(tif_paths)
             names = sorted(os.path.basename(p) for p in tif_paths)
             parsed = [_parse_coords_from_filename(n) for n in names]
-            coord_update = (
-                json.dumps([[r, c] for r, c in parsed]) if all(p is not None for p in parsed)
-                else gr.skip()
-            )
+            if all(p is not None for p in parsed):
+                coord_update = json.dumps([[r, c] for r, c in parsed])
+                warn = ""
+            else:
+                # Previously this silently left u_offax_coord untouched (gr.skip()) whenever any
+                # filename didn't match "_x###_y###" -- if that textbox had stale content from an
+                # earlier scan, the files list would update but the coordinates wouldn't, with no
+                # indication anything was wrong. Now it always reflects exactly what was just
+                # scanned: cleared here, with an explicit warning about which files couldn't be
+                # parsed, rather than silently leaving mismatched old data in place.
+                coord_update = "[]"
+                bad = [n for n, p in zip(names, parsed) if p is None]
+                warn = f" WARNING: could not parse coordinates from: {', '.join(bad)} -- fix these filenames or set coordinates manually."
             return (
                 folder, "\n".join(names),
                 gr.update(choices=names, value=None),
                 coord_update,
-                f"Found {len(names)} .tif file(s) in {folder}",
+                f"Found {len(names)} .tif file(s) in {folder}.{warn}",
             )
 
         def move_onaxis_handler(selected, offaxis_text, offaxis_coord_text):
+            # offaxis_coord_text is intentionally unused: the coordinates are always re-derived
+            # from the filenames below (see the comment on coord_update), never taken from
+            # whatever this textbox currently holds -- see the fix note just below for why.
             if not selected:
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), "Pick a file from the dropdown first."
             lines = [ln.strip() for ln in str(offaxis_text).strip().split("\n") if ln.strip()]
             if selected not in lines:
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), f"'{selected}' is not in the off-axis list."
-            idx = lines.index(selected)
-            lines.pop(idx)
+            lines.remove(selected)
 
-            coord_update = gr.skip()
-            try:
-                coords = json.loads(str(offaxis_coord_text))
-                if isinstance(coords, list) and len(coords) == len(lines) + 1:
-                    coords.pop(idx)
-                    coord_update = json.dumps(coords)
-            except (ValueError, TypeError):
-                pass
+            # Re-derive the off-axis coordinate list straight from the remaining filenames,
+            # rather than index-popping a separately-maintained JSON array to match. The old
+            # approach could silently desync files from coordinates (e.g. if a prior scan's
+            # coordinate list didn't line up 1:1 with the files list for any reason) with no
+            # warning to the user. Since every filename already embeds its own "_x###_y###"
+            # coordinate by construction (both from "Calibration folder" scans and from the
+            # interactive Calibration Setup picker), re-parsing is strictly more robust than
+            # trying to keep two parallel lists in sync through every edit -- it cannot desync.
+            reparsed = [_parse_coords_from_filename(n) for n in lines]
+            if not lines:
+                coord_update = "[]"
+                warn = ""
+            elif all(p is not None for p in reparsed):
+                coord_update = json.dumps([[r, c] for r, c in reparsed])
+                warn = ""
+            else:
+                coord_update = gr.skip()
+                bad = [n for n, p in zip(lines, reparsed) if p is None]
+                warn = f" WARNING: could not parse coordinates from: {', '.join(bad)} -- off-axis coordinates NOT updated, check these filenames."
 
             parsed = _parse_coords_from_filename(selected)
             central_update = json.dumps([parsed[0], parsed[1]]) if parsed is not None else gr.skip()
@@ -1116,7 +1346,7 @@ def build_demo() -> gr.Blocks:
             return (
                 selected, "\n".join(lines), gr.update(choices=lines, value=None),
                 central_update, coord_update,
-                f"Moved '{selected}' to the central-bead field.",
+                f"Moved '{selected}' to the central-bead field.{warn}",
             )
 
         # ── Calibration Setup handlers (click-to-crop emitter picker) ──────────
@@ -1419,8 +1649,9 @@ def build_demo() -> gr.Blocks:
             # also blocks against a concurrent Generate Training Data run: both worker threads
             # redirect the process-global sys.stdout, which corrupts each other's log streams
             # (and each other's redirection) if they ever run at the same time.
-            if _run_state["busy"] or _td_run_state["busy"]:
-                yield ("[ERROR] Another run (Phase Retrieval or Generate Training Data) is already in progress.",
+            if _run_state["busy"] or _td_run_state["busy"] or _train_run_state["busy"]:
+                yield ("[ERROR] Another run (Phase Retrieval, Generate Training Data, or Train Model) "
+                       "is already in progress.",
                        gr.skip(), gr.update(interactive=False), gr.update(interactive=True), *no_results_change)
                 return
 
@@ -1663,8 +1894,9 @@ def build_demo() -> gr.Blocks:
         def on_td_simulate(pr_results, out_dir, n_ims, *vals):
             # also blocks against a concurrent Run-tab phase retrieval — see the matching guard
             # in run_handler for why (shared sys.stdout redirection).
-            if _td_run_state["busy"] or _run_state["busy"]:
-                yield ("[ERROR] Another run (Phase Retrieval or Generate Training Data) is already in progress.",
+            if _td_run_state["busy"] or _run_state["busy"] or _train_run_state["busy"]:
+                yield ("[ERROR] Another run (Phase Retrieval, Generate Training Data, or Train Model) "
+                       "is already in progress.",
                        gr.update(interactive=False), gr.update(interactive=True))
                 return
             if pr_results is None:
@@ -1721,6 +1953,100 @@ def build_demo() -> gr.Blocks:
             if _td_run_state["stop_event"] is not None:
                 _td_run_state["stop_event"].set()
                 gr.Info("Stop requested — finishing the current frame.", duration=6)
+            return gr.update(value="⏳ Stopping…", interactive=False)
+
+        # ── Train Model tab handlers ─────────────────────────────────────────────
+
+        def on_train_load_td(training_data_dir):
+            try:
+                meta = app_utils.load_training_data_metadata(str(training_data_dir))
+            except Exception as exc:
+                return None, f"[ERROR] Could not load training data: {exc}"
+            if meta is None:
+                return None, ("No training data found yet at this path — run Generate Training "
+                               "Data first, or check the folder path.")
+            n_frames = len(meta["labels"]) - 6  # labels dict also holds ~6 metadata keys, not frames
+            D, HH, WW = meta["labels"]["volume_size"]
+            status = f"Loaded {max(n_frames, 0)} frame(s). Volume size (D,H,W) = ({D},{HH},{WW})."
+            return meta, status
+
+        def on_train_start(td_meta, *vals):
+            if _train_run_state["busy"] or _run_state["busy"] or _td_run_state["busy"]:
+                yield ("[ERROR] Another run (Phase Retrieval, Generate Training Data, or Train Model) "
+                       "is already in progress.", gr.skip(), gr.skip(),
+                       gr.update(interactive=False), gr.update(interactive=True))
+                return
+            if td_meta is None:
+                yield ("[ERROR] Load Training Data first.", gr.skip(), gr.skip(),
+                       gr.update(interactive=True), gr.update(interactive=False))
+                return
+            try:
+                cfg = fields_to_config(*vals)
+                param_dict, training_dict = cfg.generate_training_run_dict(td_meta)
+            except Exception as exc:
+                yield (f"[CONFIG ERROR] {exc}", gr.skip(), gr.skip(),
+                       gr.update(interactive=True), gr.update(interactive=False))
+                return
+
+            q: queue.SimpleQueue = queue.SimpleQueue()
+            old_stdout = sys.stdout
+            sys.stdout = _StreamToQueue(q)
+            done_evt = threading.Event()
+            run_error: list = [None]
+            result: list = [None]
+            live_box: dict = {}
+            stop_event = threading.Event()
+            _train_run_state["stop_event"] = stop_event
+            _train_run_state["busy"] = True
+
+            def _worker():
+                try:
+                    result[0] = app_utils.train_model(param_dict, training_dict, live_box=live_box, stop_event=stop_event)
+                except Exception as exc:
+                    q.put(f"\n[EXCEPTION] {exc}\n")
+                    run_error[0] = exc
+                finally:
+                    sys.stdout = old_stdout
+                    _train_run_state["busy"] = False
+                    done_evt.set()
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+            log = ""
+            last_seen_version = 0
+            while True:
+                try:
+                    chunk = q.get(timeout=0.2)
+                    log += chunk
+                except queue.Empty:
+                    if done_evt.is_set():
+                        break
+
+                version = live_box.get("version", 0)
+                if version != last_seen_version:
+                    last_seen_version = version
+                    plot_update = _build_train_live_figure(live_box)
+                else:
+                    plot_update = gr.skip()
+                stop_btn_update = gr.skip() if stop_event.is_set() else gr.update(interactive=True)
+                yield log, plot_update, gr.skip(), gr.update(interactive=False), stop_btn_update
+
+            while not q.empty():
+                log += q.get_nowait()
+
+            version = live_box.get("version", 0)
+            plot_update = _build_train_live_figure(live_box) if version != last_seen_version else gr.skip()
+
+            _train_run_state["stop_event"] = None
+            log += "\n\n--- DONE ---" if run_error[0] is None else f"\n\n--- FAILED: {run_error[0]} ---"
+            summary = f"net_file={result[0][0]}, fit_file={result[0][1]}" if result[0] else gr.skip()
+            yield (log, plot_update, summary,
+                   gr.update(interactive=True), gr.update(value="Stop", interactive=False))
+
+        def on_train_stop():
+            if _train_run_state["stop_event"] is not None:
+                _train_run_state["stop_event"].set()
+                gr.Info("Stop requested — finishing the current epoch and saving a resumable checkpoint.", duration=6)
             return gr.update(value="⏳ Stopping…", interactive=False)
 
         load_file.change(fn=load_handler, inputs=load_file, outputs=all_fields)
@@ -1841,6 +2167,16 @@ def build_demo() -> gr.Blocks:
             outputs=[td_log_out, td_simulate_btn, td_stop_btn],
         )
         td_stop_btn.click(fn=on_td_stop, outputs=td_stop_btn)
+        # Train Model's training-data-folder field auto-populates from Generate Training Data's
+        # own output-folder field, so the path doesn't need retyping between tabs — still a plain
+        # editable Textbox the user can override by hand at any time.
+        td_out_dir.change(fn=lambda v: v, inputs=[td_out_dir], outputs=[train_data_dir])
+        train_load_td_btn.click(fn=on_train_load_td, inputs=[train_data_dir], outputs=[train_td_meta_state, train_td_status])
+        train_start_btn.click(
+            fn=on_train_start, inputs=[train_td_meta_state] + all_fields,
+            outputs=[train_log_out, train_live_plot, train_summary, train_start_btn, train_stop_btn],
+        )
+        train_stop_btn.click(fn=on_train_stop, outputs=train_stop_btn)
 
         demo.load(None, None, None, js=SETUP_CROP_CURSOR_JS)
 

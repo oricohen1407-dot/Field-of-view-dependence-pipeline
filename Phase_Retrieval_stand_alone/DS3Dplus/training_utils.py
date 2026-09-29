@@ -81,6 +81,7 @@ class Trainer(abc.ABC):
             history: dict = None,
             best_metric=None,
             epochs_without_improvement: int = 0,
+            stop_event=None,
             **kw,
             ) -> FitResult:
         """
@@ -166,11 +167,19 @@ class Trainer(abc.ABC):
                     torch.save(ckpt, checkpoints['file_name'])
                     print(f"\n*** Saved BEST checkpoint {checkpoints['file_name']}")
 
+            if post_epoch_fn:
+                post_epoch_fn(
+                    epoch=actual_num_epochs, total_epochs=total_target_epoch,
+                    train_loss=train_loss[-1], test_loss=test_loss[-1], is_best=is_best,
+                    best_metric=best_metric, epochs_without_improvement=epochs_without_improvement,
+                    lr=self.optimizer.param_groups[0]['lr'], model=self.model,
+                )
+
             if early_stopping and epochs_without_improvement == early_stopping:
                 break
 
-            if post_epoch_fn:
-                pass
+            if stop_event is not None and stop_event.is_set():
+                break
 
         return FitResult(actual_num_epochs, train_loss, train_acc, test_loss, test_acc)
     # end

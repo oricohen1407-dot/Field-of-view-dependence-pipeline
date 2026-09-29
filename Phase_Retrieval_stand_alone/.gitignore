@@ -223,6 +223,9 @@ mask_fit_outputs/
 phase_retrieval_outputs/
 phase_retrieval_with_displacement_iteration/
 calibration_setup_emitters/
+calibration_folder_imports/
+training_data/
+training_results/
 PSFs.jpg
 
 # Config

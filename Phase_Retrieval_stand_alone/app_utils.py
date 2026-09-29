@@ -12,8 +12,15 @@ from scipy import ndimage
 from datetime import datetime
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
 from image_model import ImModel_pr
-from DS3Dplus.ds3d_utils import ImModel, ImModelBase, ImModelTraining, Sampling
+from DS3Dplus.ds3d_utils import (
+    ImModel, ImModelBase, ImModelTraining, Sampling,
+    MyDataset, LON as Net, KDE_loss3D, Volume2XYZ, calc_jaccard_rmse, select_device,
+)
+from DS3Dplus.training_utils import TorchTrainer
 
 def _load_zstack_with_count(path: str):
     """Z (slice count) is authoritative from the file itself — these TIFFs carry no
@@ -1198,3 +1205,358 @@ def generate_training_data(param_dict: dict, out_dir: str, n_ims: int, stop_even
         pickle.dump(param_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"[TD] done. wrote {written} frames to {out_dir} "
           f"(index {start_i:05d}-{start_i + max(written, 1) - 1:05d}).")
+
+
+# ============================================================
+# Train Model
+# ============================================================
+
+def maybe_build_x_memmap(td_folder, force_rebuild=False):
+    """
+    Build or reuse a memmap cache for training_data/x/*.tif.
+    Keeps TIFFs on disk for debugging, but training can read from one binary file.
+
+    Returns:
+        cache_info: dict with keys enabled, data_path, shape, dtype, ids
+    """
+    x_folder = os.path.join(td_folder, 'x')
+    data_path = os.path.join(td_folder, 'x_memmap.dat')
+    ids_path = os.path.join(td_folder, 'x_ids.npy')
+
+    ids = sorted([f for f in os.listdir(x_folder) if f.lower().endswith('.tif')])
+    if len(ids) == 0:
+        raise RuntimeError(f'No TIFF files found in {x_folder}')
+
+    first_im = io.imread(os.path.join(x_folder, ids[0]))
+    H, W = first_im.shape
+    dtype = first_im.dtype
+
+    rebuild = force_rebuild
+    if (not os.path.exists(data_path)) or (not os.path.exists(ids_path)):
+        rebuild = True
+    else:
+        try:
+            cached_ids = np.load(ids_path, allow_pickle=True).tolist()
+            if cached_ids != ids:
+                rebuild = True
+            else:
+                expected_bytes = len(ids) * H * W * np.dtype(dtype).itemsize
+                actual_bytes = os.path.getsize(data_path)
+                if actual_bytes != expected_bytes:
+                    rebuild = True
+        except Exception:
+            rebuild = True
+
+    if rebuild:
+        print(f'[memmap] building cache from TIFFs in {x_folder}')
+        X = np.memmap(data_path, mode='w+', dtype=dtype, shape=(len(ids), H, W))
+        for i, fname in enumerate(ids):
+            if i % 1000 == 0:
+                print(f'[memmap] packing [{i} / {len(ids)}]')
+            im = io.imread(os.path.join(x_folder, fname))
+            if im.shape != (H, W):
+                raise ValueError(f'Image shape mismatch for {fname}: {im.shape} vs {(H, W)}')
+            X[i] = im
+        X.flush()
+        np.save(ids_path, np.array(ids, dtype=object), allow_pickle=True)
+        print(f'[memmap] cache saved: {data_path}')
+    else:
+        print(f'[memmap] reusing existing cache: {data_path}')
+
+    return dict(enabled=True, data_path=data_path, shape=(len(ids), H, W),
+                dtype=np.dtype(dtype).str, ids=ids)
+
+
+def load_training_data_metadata(td_folder: str):
+    """Loads <td_folder>/param.pickle + y.pickle, written by generate_training_data(). Returns
+    None (not an exception) if Generate Training Data hasn't produced them yet, or x/ is empty."""
+    param_path = os.path.join(td_folder, "param.pickle")
+    y_path = os.path.join(td_folder, "y.pickle")
+    x_dir = os.path.join(td_folder, "x")
+    if not (os.path.isfile(param_path) and os.path.isfile(y_path) and os.path.isdir(x_dir)):
+        return None
+    if not any(f.lower().endswith(('.tif', '.tiff')) for f in os.listdir(x_dir)):
+        return None
+    with open(param_path, "rb") as f:
+        param_dict = pickle.load(f)
+    with open(y_path, "rb") as f:
+        labels = pickle.load(f)
+    return {"param_dict": param_dict, "labels": labels}
+
+
+def _make_post_epoch_fn(live_box, validate_ds, param_dict, t0, sample_viz_every_epochs):
+    """Builds the per-epoch callback passed as Trainer.fit(post_epoch_fn=...). Tracks loss/LR
+    history and, every sample_viz_every_epochs epochs (or on a new best), renders a fixed
+    validation tile's predicted-vs-ground-truth max-projection (+ a best-effort Jaccard/RMSE
+    readout) into live_box for the GUI's live monitor. Never raises -- a failure here must not
+    interrupt training."""
+    device = param_dict['device']
+    train_loss_history, test_loss_history, lr_history = [], [], []
+
+    viz_x, viz_y = validate_ds[0]
+    volume2xyz = None
+    try:
+        volume2xyz = Volume2XYZ(params={
+            'blob_r': param_dict['blob_r'], 'vs_xy': param_dict['vs_xy'],
+            'vs_z': param_dict['vs_z'], 'zrange': param_dict['zrange'],
+            'threshold': param_dict['threshold'], 'device': device,
+        })
+    except Exception as exc:
+        print(f"[TRAIN] WARNING: could not build Volume2XYZ for the debug panel: {exc}")
+
+    def post_epoch_fn(epoch, total_epochs, train_loss, test_loss, is_best, best_metric,
+                       epochs_without_improvement, lr, model):
+        train_loss_history.append(train_loss)
+        test_loss_history.append(test_loss)
+        lr_history.append(lr)
+
+        snapshot = {
+            'epoch': epoch, 'total_epochs': total_epochs,
+            'train_loss_history': list(train_loss_history), 'test_loss_history': list(test_loss_history),
+            'lr_history': list(lr_history), 'lr': lr,
+            'best_metric': best_metric, 'epochs_without_improvement': epochs_without_improvement,
+            'elapsed_s': time.time() - t0,
+        }
+        avg_epoch_s = snapshot['elapsed_s'] / max(epoch, 1)
+        snapshot['eta_s'] = avg_epoch_s * max(total_epochs - epoch, 0)
+
+        if is_best or (sample_viz_every_epochs > 0 and epoch % sample_viz_every_epochs == 0):
+            try:
+                model.eval()
+                with torch.no_grad():
+                    x_t = torch.from_numpy(viz_x).unsqueeze(0).to(device)
+                    pred = model(x_t)
+                snapshot['pred_proj'] = pred[0].max(dim=0).values.cpu().numpy()
+                snapshot['target_proj'] = viz_y.max(axis=0)
+                snapshot['viz_epoch'] = epoch
+
+                if volume2xyz is not None:
+                    xyz_rec, _ = volume2xyz(pred)
+                    xyz_ids = np.asarray(param_dict['_viz_xyz_ids'])
+                    WW, HH = param_dict['WW'], param_dict['HH']
+                    x_gt = (xyz_ids[:, 0] - (WW - 1) / 2) * param_dict['vs_xy']
+                    y_gt = (xyz_ids[:, 1] - (HH - 1) / 2) * param_dict['vs_xy']
+                    z_gt = (xyz_ids[:, 2] + 0.5) * param_dict['vs_z'] + param_dict['zrange'][0]
+                    xyz_gt = np.c_[x_gt, y_gt, z_gt]
+                    if xyz_rec is not None and len(xyz_rec) > 0 and len(xyz_gt) > 0:
+                        jacc, rmse_xy, rmse_z, _ = calc_jaccard_rmse(xyz_gt, xyz_rec, 0.1)
+                        snapshot['sample_jaccard'] = jacc
+                        snapshot['sample_rmse_xy'] = rmse_xy
+                        snapshot['sample_rmse_z'] = rmse_z
+            except Exception as exc:
+                print(f"[TRAIN] WARNING: sample-viz/Jaccard readout failed this epoch: {exc}")
+            finally:
+                model.train()
+
+        if live_box is not None:
+            live_box.update(snapshot)
+            live_box['version'] = live_box.get('version', 0) + 1
+
+    return post_epoch_fn
+
+
+def train_model(param_dict: dict, training_dict: dict, live_box: dict = None, stop_event=None):
+    """Trains a localization CNN (LON) on data written by generate_training_data(), faithfully
+    porting the root pipeline's training_func(): same MyDataset/LON/KDE_loss3D/Adam+
+    ReduceLROnPlateau/checkpointing/resume/90-10 sequential split behavior. Adds stop_event
+    support and a live_box progress-snapshot mechanism (see _make_post_epoch_fn) on top --
+    neither changes the training math itself.
+    Returns (net_file, fit_file), matching root's own training_func()."""
+    np.random.seed(training_dict.get('numpy_seed', 66))
+    torch.manual_seed(training_dict.get('torch_seed', 88))
+
+    device = torch.device(param_dict['device'])
+    print(f'device used (train_model): {device}')
+    torch.backends.cudnn.benchmark = True
+
+    td_folder = param_dict['td_folder']
+    path_save = param_dict['path_save']
+    os.makedirs(path_save, exist_ok=True)
+
+    batch_size = training_dict['batch_size']
+    lr = training_dict['lr']
+    num_epochs = training_dict['num_epochs']
+    num_workers = training_dict.get('num_workers', 0)
+
+    params_train = dict(batch_size=batch_size, num_workers=num_workers,
+                         pin_memory=(device.type == 'cuda'))
+    if num_workers > 0:
+        params_train.update(persistent_workers=True, prefetch_factor=4)
+    params_validate = dict(params_train, shuffle=False)
+
+    x_folder = os.path.join(td_folder, 'x')
+    x_cache = maybe_build_x_memmap(td_folder, force_rebuild=False)
+    x_list = list(x_cache['ids'])
+    num_x = len(x_list)
+
+    with open(os.path.join(td_folder, 'y.pickle'), 'rb') as handle:
+        labels = pickle.load(handle)
+
+    if training_dict.get('shuffle_split', False):
+        rng = np.random.RandomState(training_dict.get('numpy_seed', 66))
+        x_list = list(x_list)
+        rng.shuffle(x_list)
+
+    split = training_dict.get('train_val_split', 0.9)
+    partition = {'train': x_list[:int(num_x * split)], 'validate': x_list[int(num_x * split):]}
+    train_ds = MyDataset(x_folder, partition['train'], labels, cache_info=x_cache)
+    validate_ds = MyDataset(x_folder, partition['validate'], labels, cache_info=x_cache)
+
+    train_dl = DataLoader(train_ds, **params_train)
+    validate_dl = DataLoader(validate_ds, **params_validate)
+
+    D, us_factor, maxv = labels['volume_size'][0], labels['us_factor'], labels['blob_maxv']
+
+    resume_file = training_dict.get('resume_net_file', None)
+    if resume_file == 'None':
+        resume_file = None
+
+    model = Net(D=D, us_factor=us_factor, maxv=maxv).to(device)
+    optimizer = Adam(list(model.parameters()), lr=lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=1, min_lr=1e-6)
+
+    start_epoch = 0
+    best_metric = None
+    epochs_without_improvement = 0
+    history = {'train_loss': [], 'train_acc': [], 'test_loss': [], 'test_acc': []}
+    resume_checkpoint = None
+
+    if resume_file is not None:
+        ckpt_path = os.path.join(path_save, resume_file)
+        # weights_only=False: this checkpoint is the app's own locally-created file (contains a
+        # raw LON module instance under 'net', not just tensors), and PyTorch 2.6+ defaults
+        # torch.load to weights_only=True, which would otherwise refuse to unpickle it.
+        resume_checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+        state_dict = resume_checkpoint.get('model_state_dict', resume_checkpoint.get('state_dict'))
+        model.load_state_dict(state_dict)
+
+        if resume_checkpoint.get('optimizer_state_dict') is not None:
+            optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr  # force the new run's LR, matching root's deliberate resume behavior
+        if resume_checkpoint.get('scheduler_state_dict') is not None:
+            scheduler.load_state_dict(resume_checkpoint['scheduler_state_dict'])
+
+        start_epoch = int(resume_checkpoint.get('epoch', 0))
+        best_metric = resume_checkpoint.get('best_metric', None)
+        epochs_without_improvement = int(resume_checkpoint.get('epochs_without_improvement', 0))
+        history = resume_checkpoint.get('fit_history', history)
+
+        rng_state = resume_checkpoint.get('torch_rng_state', None)
+        if rng_state is not None:
+            try:
+                if isinstance(rng_state, torch.Tensor):
+                    rng_state = rng_state.detach().cpu()
+                    if rng_state.dtype != torch.uint8:
+                        rng_state = rng_state.to(torch.uint8)
+                    torch.set_rng_state(rng_state)
+                elif isinstance(rng_state, np.ndarray):
+                    torch.set_rng_state(torch.from_numpy(rng_state.astype(np.uint8)))
+                elif isinstance(rng_state, (list, tuple)):
+                    torch.set_rng_state(torch.tensor(rng_state, dtype=torch.uint8))
+                else:
+                    print(f"[resume] skipping torch RNG restore: unsupported type {type(rng_state)}")
+            except Exception as e:
+                print(f"[resume] skipping torch RNG restore: {e}")
+
+        np_state = resume_checkpoint.get('numpy_rng_state', None)
+        if np_state is not None:
+            try:
+                np.random.set_state(np_state)
+            except Exception as e:
+                print(f"[resume] skipping NumPy RNG restore: {e}")
+
+        cuda_state = resume_checkpoint.get('cuda_rng_state_all', None)
+        if torch.cuda.is_available() and cuda_state is not None:
+            try:
+                fixed_cuda_state = []
+                for st in cuda_state:
+                    if isinstance(st, torch.Tensor):
+                        st = st.detach().cpu()
+                        if st.dtype != torch.uint8:
+                            st = st.to(torch.uint8)
+                    elif isinstance(st, np.ndarray):
+                        st = torch.from_numpy(st.astype(np.uint8))
+                    elif isinstance(st, (list, tuple)):
+                        st = torch.tensor(st, dtype=torch.uint8)
+                    else:
+                        raise TypeError(f"unsupported CUDA RNG state type: {type(st)}")
+                    fixed_cuda_state.append(st)
+                torch.cuda.set_rng_state_all(fixed_cuda_state)
+            except Exception as e:
+                print(f"[resume] skipping CUDA RNG restore: {e}")
+
+        print(f'[resume] loaded full training state: {ckpt_path}')
+        print(f'[resume] continuing from epoch {start_epoch}')
+    else:
+        print('[resume] starting from scratch')
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'# of trainable parameters: {n_params}')
+
+    tv_z_weight = 0  # dead/inert in root (multiplied by 0 there too) -- ported faithfully as-is
+    if param_dict['us_factor'] == 1:
+        my_loss_func = KDE_loss3D(sigma=1.0, device=device, tv_z_weight=tv_z_weight)
+    else:
+        my_loss_func = KDE_loss3D(sigma=0.5 * (param_dict['us_factor'] / 2), device=device,
+                                   tv_z_weight=tv_z_weight)
+
+    trainer = TorchTrainer(model, my_loss_func, optimizer, lr_scheduler=scheduler, device=device)
+
+    if resume_checkpoint is not None:
+        best_file_path = resume_checkpoint.get('file_name', None)
+        last_file_path = resume_checkpoint.get('last_file_name', None)
+        if best_file_path is None:
+            time_now = datetime.today().strftime('%m-%d_%H-%M')
+            net_file = 'net_' + time_now + '.pt'
+            best_file_path = os.path.join(path_save, net_file)
+        else:
+            net_file = os.path.basename(best_file_path)
+        if last_file_path is None:
+            last_net_file = ('last_' + net_file if net_file.startswith('net_')
+                              else 'last_net_' + datetime.today().strftime('%m-%d_%H-%M') + '.pt')
+            last_file_path = os.path.join(path_save, last_net_file)
+        else:
+            last_net_file = os.path.basename(last_file_path)
+    else:
+        time_now = datetime.today().strftime('%m-%d_%H-%M')
+        net_file = 'net_' + time_now + '.pt'
+        last_net_file = 'last_net_' + time_now + '.pt'
+        best_file_path = os.path.join(path_save, net_file)
+        last_file_path = os.path.join(path_save, last_net_file)
+
+    checkpoints = dict(
+        file_name=best_file_path, last_file_name=last_file_path,
+        net=Net(D=D, us_factor=us_factor, maxv=maxv), state_dict=None,
+        note='resume-capable checkpoint',
+    )
+
+    # cache one validation tile's GT voxel-index positions for the debug panel's Jaccard readout
+    param_dict = dict(param_dict)
+    viz_id = partition['validate'][0] if partition['validate'] else partition['train'][0]
+    param_dict['_viz_xyz_ids'] = labels[viz_id][0]
+
+    t0 = time.time()
+    post_epoch_fn = _make_post_epoch_fn(
+        live_box, validate_ds, param_dict, t0,
+        training_dict.get('sample_viz_every_epochs', 5),
+    )
+    fit_results = trainer.fit(
+        train_dl, validate_dl, num_epochs=num_epochs, checkpoints=checkpoints,
+        early_stopping=training_dict.get('early_stopping', 15),
+        start_epoch=start_epoch, history=history, best_metric=best_metric,
+        epochs_without_improvement=epochs_without_improvement,
+        post_epoch_fn=post_epoch_fn, stop_event=stop_event,
+    )
+
+    fit_stamp = datetime.today().strftime('%m-%d_%H-%M')
+    fit_file = 'fit_' + fit_stamp + '.pickle'
+    with open(os.path.join(path_save, fit_file), 'wb') as handle:
+        pickle.dump(fit_results, handle)
+
+    t1 = time.time()
+    print(f'training results in {net_file}, {last_net_file} and {fit_file}')
+    print(f'finished training in {t1 - t0}s.')
+
+    return net_file, fit_file
