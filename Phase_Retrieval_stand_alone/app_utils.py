@@ -1176,7 +1176,10 @@ def estimate_signal_range(param_dict: dict, baseline_mu: float, exp_maxv: float,
     """
     model = ImModelBase(param_dict)
     zmin, zmax = param_dict['zrange']
-    xyzp = np.array([[0.0, 0.0, (zmin + zmax) / 2.0, photon_count]], dtype=np.float32)
+    # Shift by the training NFP, same as _simulate_one_frame's render path, so this reference
+    # PSF's phase convention matches what generate_training_data() actually renders.
+    z_ref = (zmin + zmax) / 2.0 - param_dict['nfp_training_um']
+    xyzp = np.array([[0.0, 0.0, z_ref, photon_count]], dtype=np.float32)
     xyzps = torch.from_numpy(xyzp).to(param_dict['device'])
     sim_peak = float(model.get_psfs(xyzps).detach().cpu().numpy().max())
     if sim_peak <= 0:
@@ -1205,11 +1208,18 @@ def _simulate_one_frame(model, sampling, param_dict):
     ps_xy = param_dict['ps_camera'] / param_dict['M']
     canvas = np.zeros((H, W), dtype=np.float32)
 
+    nfp_training_um = param_dict['nfp_training_um']
     for k in range(xyzps.shape[0]):
         x_um, y_um = xyzps[k, 0], xyzps[k, 1]
         c = int(round(x_um / ps_xy + (W - 1) / 2))
         r = int(round(y_um / ps_xy + (H - 1) / 2))
-        patch = model.psf_patch_clean(xyzps[k].astype(np.float32))
+        # Shift only the z fed into the PSF renderer by the training NFP, so emitters render on
+        # both sides of focus instead of all adding defocus phase of the same sign; xyz_ids/
+        # blob3d (the ground-truth labels) are untouched -- they come from sampling.xyzp_batch()
+        # independently of this shifted render-only copy.
+        xyzp_render = xyzps[k].copy()
+        xyzp_render[2] -= nfp_training_um
+        patch = model.psf_patch_clean(xyzp_render.astype(np.float32))
         ph, pw = patch.shape
         # ph//2 elements before the center row, ph-ph//2 at/after it -- NOT symmetric ("+1")
         # for an even ph. The old `rr1 = r + pr + 1` assumed an odd patch size (true 121x121

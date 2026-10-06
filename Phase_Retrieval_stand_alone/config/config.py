@@ -108,6 +108,9 @@ class TrainingDataConfig:
     experimental_data_file: str = ""       # path to a single multi-page TIFF of real-data frames, accessible from the HOSTING SERVER, not the browser's machine
     snr_subsample_frames: int = 10         # how many frames (pages) to read from that file (never the whole file)
 
+    # --- Training NFP (z of best focus) — appended, keeps every index above stable ---
+    nfp_training_um: str = ""              # "" => midpoint of zmin/zmax at generation time; shifts only the simulated PSFs' defocus phase (z - NFP), not the z ground-truth labels, so emitters render on both sides of focus
+
 
 @dataclass
 class TrainingRunConfig:
@@ -197,6 +200,7 @@ class Config:
             )
         zrange_source = t.zrange_um if t.zrange_um.strip() else u.zrange
         zmin, zmax = (float(x) for x in zrange_source.split(','))
+        nfp_training_um = float(t.nfp_training_um) if t.nfp_training_um.strip() else (zmin + zmax) / 2.0
         ps_xy = u.ps_camera / u.M
         bg_lo, bg_hi = (float(x) for x in t.background_range.split(','))
         g_sigma_fitted = pr_results['g_sigma']
@@ -218,6 +222,7 @@ class Config:
             'HH': int(H * us), 'WW': int(W * us),
             'buffer_HH': int(psf_half_size_px * us), 'buffer_WW': int(psf_half_size_px * us),
             'vs_xy': ps_xy / us, 'vs_z': (zmax - zmin) / D, 'zrange': (zmin, zmax),
+            'nfp_training_um': nfp_training_um,
             'Nsig_range': tuple(float(x) for x in t.signal_range.split(',')),
             'num_particles_range': [int(float(x)) for x in t.density_range.split(',')],
             'blob_r': t.blob_r, 'blob_sigma': t.blob_sigma, 'blob_maxv': t.blob_maxv,

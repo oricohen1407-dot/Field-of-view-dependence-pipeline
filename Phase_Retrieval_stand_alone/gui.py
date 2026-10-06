@@ -635,7 +635,7 @@ def _opt_str(v):
 
 
 def config_to_fields(cfg: Config) -> list:
-    """Flatten a Config into the ordered list of Gradio field values (80 items)."""
+    """Flatten a Config into the ordered list of Gradio field values (81 items)."""
     u, a, t, tr = cfg.user, cfg.advanced, cfg.training, cfg.training_run
     sig_lo, sig_hi = (float(x) for x in t.signal_range.split(','))
     bg_lo, bg_hi = (float(x) for x in t.background_range.split(','))
@@ -643,6 +643,7 @@ def config_to_fields(cfg: Config) -> list:
     z_source = t.zrange_um if t.zrange_um.strip() else u.zrange
     z_lo, z_hi = (float(x) for x in z_source.split(','))
     noff_lo, noff_hi = (float(x) for x in t.noise_offset_range.split(','))
+    nfp_training = float(t.nfp_training_um) if t.nfp_training_um.strip() else (z_lo + z_hi) / 2.0
     return [
         # ── Microscope preset fields, part 1 (7 of 8 — bitdepth is with AdvancedConfig below) ──
         u.M, u.NA, u.n_immersion, u.lamda, u.n_sample,
@@ -696,6 +697,8 @@ def config_to_fields(cfg: Config) -> list:
         tr.numpy_seed, tr.torch_seed, tr.sample_viz_every_epochs, tr.viz_threshold,
         # ── Generate Training Data — experimental-data sampling — appended, keeps every index above stable ──
         t.experimental_data_file, t.snr_subsample_frames,
+        # ── Generate Training Data — training NFP (z of best focus) — appended, keeps every index above stable ──
+        nfp_training,
     ]
 
 
@@ -738,6 +741,8 @@ def fields_to_config(
     train_num_workers, train_numpy_seed, train_torch_seed, train_sample_viz_every, train_viz_threshold,
     # Generate Training Data — experimental-data sampling (2)
     td_exp_data_file, td_snr_subsample_frames,
+    # Generate Training Data — training NFP (1)
+    td_nfp_training,
 ) -> Config:
     """Parse ordered Gradio field values back into a Config object."""
     offaxis_files = [
@@ -805,6 +810,7 @@ def fields_to_config(
             noise_offset_range=f"{float(td_noise_off_min)}, {float(td_noise_off_max)}",
             experimental_data_file=str(td_exp_data_file).strip(),
             snr_subsample_frames=int(float(td_snr_subsample_frames)),
+            nfp_training_um=str(float(td_nfp_training)),
         ),
         training_run=TrainingRunConfig(
             training_data_dir=str(train_data_dir).strip(),
@@ -1167,6 +1173,12 @@ def build_demo() -> gr.Blocks:
                 with gr.Row(equal_height=True):
                     td_zmin = gr.Number(label="Z min (µm)", value=defaults[53])
                     td_zmax = gr.Number(label="Z max (µm)", value=defaults[54])
+                td_nfp_training = gr.Number(
+                    label="Training NFP (z of best focus, µm)", value=defaults[80],
+                    info="Defaults to the midpoint of Z min/Z max. Shifts the simulated PSFs' "
+                         "defocus so emitters above this z render as above focus and emitters "
+                         "below it render as below focus, instead of all defocusing the same way.",
+                )
                 td_canvas_size = gr.Number(label="Training-frame canvas size (px)", value=defaults[55], precision=0)
 
                 with gr.Accordion("Advanced", open=False):
@@ -1284,6 +1296,7 @@ def build_demo() -> gr.Blocks:
             train_batch_size, train_lr, train_early_stopping, train_val_split, train_shuffle_split,
             train_num_workers, train_numpy_seed, train_torch_seed, train_sample_viz_every, train_viz_threshold,
             td_exp_data_file, td_subsample_n,
+            td_nfp_training,
         ]
 
         # microscope preset fields, in the fixed order used by microscopes.json entries
