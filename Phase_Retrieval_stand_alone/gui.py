@@ -1100,17 +1100,8 @@ def build_demo() -> gr.Blocks:
                     )
                 td_pr_results_state = gr.State(initial_pr_results)
 
-                gr.Markdown(
-                    "### 2. Sample frames from your experimental data and mark two reference regions\n"
-                    "**Enter the path to a single experimental data file (a multi-page TIFF "
-                    "stack) that is accessible from the machine hosting this GUI — not a path "
-                    "on your own computer.** Only a small, evenly-spaced **subsample** of its "
-                    "pages/frames is ever read into memory here — never the whole file.\n\n"
-                    "Mark a **no-emitter** patch (baseline/noise) and a **bright emitter** patch "
-                    "(peak signal) on the displayed frame — together they calibrate Background, "
-                    "Noise offset, and Signal against your real data, mirroring how the root "
-                    "pipeline's SNR-characterization step works."
-                )
+                gr.Markdown("### 2. Sample frames from your experimental data and mark two reference regions")
+                gr.Markdown("**Server-side file path — only a small subsample is read.**")
                 with gr.Row(equal_height=True):
                     td_exp_data_file = gr.Textbox(
                         label="Experimental data file (path on the server hosting this GUI)",
@@ -1129,7 +1120,8 @@ def build_demo() -> gr.Blocks:
                     with gr.Column():
                         td_mark_mode = gr.Radio(
                             ["No-emitter region (baseline)", "Bright emitter (peak signal)"],
-                            value="No-emitter region (baseline)", label="Click marks",
+                            value="No-emitter region (baseline)",
+                            label="What to mark: no-emitter region, then bright emitter",
                             elem_id="td_mark_mode",
                         )
                         td_noise_w = gr.Number(
