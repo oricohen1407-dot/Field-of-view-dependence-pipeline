@@ -1096,14 +1096,10 @@ def build_demo() -> gr.Blocks:
 
                 gr.Markdown(
                     "### 2. Sample frames from your experimental data and mark two reference regions\n"
-                    "**Enter the path to a single experimental data file that is accessible from "
-                    "the machine hosting this GUI (the server) — not a path on your own "
-                    "computer.** That file (a multi-page TIFF stack of real acquisition frames) "
-                    "is typically far too large to upload through the browser, and Inference "
-                    "will read directly from this same file later anyway, so this tab points at "
-                    "it in place instead of uploading a copy. Only a small, evenly-spaced "
-                    "**subsample** of its pages/frames is ever read into memory here — never "
-                    "the whole file.\n\n"
+                    "**Enter the path to a single experimental data file (a multi-page TIFF "
+                    "stack) that is accessible from the machine hosting this GUI — not a path "
+                    "on your own computer.** Only a small, evenly-spaced **subsample** of its "
+                    "pages/frames is ever read into memory here — never the whole file.\n\n"
                     "Mark a **no-emitter** patch (baseline/noise) and a **bright emitter** patch "
                     "(peak signal) on the displayed frame — together they calibrate Background, "
                     "Noise offset, and Signal against your real data, mirroring how the root "
@@ -1141,12 +1137,10 @@ def build_demo() -> gr.Blocks:
                     ["Current frame", "Across all sampled frames (temporal)"],
                     value="Current frame", label="Estimate noise/peak from",
                     info="Temporal: baseline mean/std come from the single darkest-mean pixel's "
-                         "own value over every SAMPLED frame (T) (isolates real per-pixel noise "
+                         "own value over every sampled frame (T) (isolates real per-pixel noise "
                          "from spatial non-uniformity); peak is the max over every sampled frame "
                          "in the marked emitter box (catches a blinking emitter automatically). "
-                         "Mirrors the method already used in the AutoDS3D/root pipeline's SNR "
-                         "step — T indexes separate sampled pages/frames of the file, so this is "
-                         "genuinely temporal.",
+                         "Mirrors the method used in the AutoDS3D/root pipeline's SNR step.",
                 )
                 td_frame_state = gr.State(None)
                 td_noise_bbox_state = gr.State(None)
