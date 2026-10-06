@@ -1137,8 +1137,7 @@ def build_demo() -> gr.Blocks:
                     info="Temporal: baseline mean/std come from the single darkest-mean pixel's "
                          "own value over every sampled frame (T) (isolates real per-pixel noise "
                          "from spatial non-uniformity); peak is the max over every sampled frame "
-                         "in the marked emitter box (catches a blinking emitter automatically). "
-                         "Mirrors the method used in the AutoDS3D/root pipeline's SNR step.",
+                         "in the marked emitter box (catches a blinking emitter automatically).",
                 )
                 td_frame_state = gr.State(None)
                 td_noise_bbox_state = gr.State(None)
