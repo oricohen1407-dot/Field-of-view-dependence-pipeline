@@ -1126,13 +1126,6 @@ def sample_experimental_frames(path: str, n_samples: int, attempts: int = 8, bas
     }
 
 
-def noise_patch_stats(frame: np.ndarray, bbox):
-    """Mean/std of pixel values inside a user-marked no-emitter rectangle, bbox=(r0, r1, c0, c1)."""
-    r0, r1, c0, c1 = bbox
-    patch = frame[r0:r1, c0:c1]
-    return float(patch.mean()), float(patch.std())
-
-
 def temporal_noise_baseline(stack: np.ndarray, bbox):
     """Mean/std of the single darkest-mean pixel within bbox, across every frame of `stack`
     (Z,H,W) -- mirrors the AutoDS3D/root pipeline's mu_std_p(): isolates genuine per-pixel
