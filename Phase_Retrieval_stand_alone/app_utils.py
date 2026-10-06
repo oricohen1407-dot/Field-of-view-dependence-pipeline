@@ -1201,6 +1201,19 @@ def _simulate_one_frame(model, sampling, param_dict):
     ps_xy = param_dict['ps_camera'] / param_dict['M']
     canvas = np.zeros((H, W), dtype=np.float32)
 
+    # Randomize where THIS frame's canvas sits within the real, larger sensor, so emitters
+    # aren't always rendered as if their tile were exactly on-axis. The mask-offset-propagation
+    # step in psf_patch_clean converts an emitter's lateral position into a literal shift of
+    # which patch of the (spatially fixed, non-uniform) phase mask its light passes through --
+    # a tile that's always centered on-axis only ever explores the small range of that shift
+    # reachable within one canvas, never the larger shifts a tile far from the true optical axis
+    # would see. One draw per frame (not per emitter): a single camera frame corresponds to one
+    # fixed position in the real sensor.
+    max_offset_px = (param_dict['full_fov_px'] - H) / 2.0
+    tile_row = H / 2.0 + (np.random.uniform(-max_offset_px, max_offset_px) if max_offset_px > 0 else 0.0)
+    tile_col = W / 2.0 + (np.random.uniform(-max_offset_px, max_offset_px) if max_offset_px > 0 else 0.0)
+    model.centralBeadCoordinates_pixel = [tile_row, tile_col]
+
     nfp_training_um = param_dict['nfp_training_um']
     for k in range(xyzps.shape[0]):
         x_um, y_um = xyzps[k, 0], xyzps[k, 1]
