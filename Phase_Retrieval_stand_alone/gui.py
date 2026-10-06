@@ -9,6 +9,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -55,7 +56,9 @@ def _make_emitters_out_dir(raw_stem: str) -> str:
     one) never pile near-duplicate crops (e.g. the same emitter re-picked a pixel or two off)
     into a shared folder."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return str(CALIBRATION_EMITTERS_DIR / f"{raw_stem}_{timestamp}_emitters")
+    suffix = uuid.uuid4().hex[:8]  # strftime alone is only 1-second resolution; two scans of
+    # the same raw file within the same second would otherwise collide into one folder.
+    return str(CALIBRATION_EMITTERS_DIR / f"{raw_stem}_{timestamp}_{suffix}_emitters")
 
 
 def _import_calib_folder(tif_paths: list) -> str:
@@ -66,8 +69,12 @@ def _import_calib_folder(tif_paths: list) -> str:
     instead of trying to reconstruct a shared folder out of Gradio's own scattered per-file
     temp layout."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = CALIBRATION_FOLDER_IMPORTS_DIR / timestamp
-    os.makedirs(out_dir, exist_ok=True)
+    suffix = uuid.uuid4().hex[:8]  # strftime alone is only 1-second resolution; two scans
+    # within the same second (e.g. a fast re-browse, or concurrent clients on a shared server)
+    # would otherwise resolve to the identical folder and exist_ok=True would silently merge
+    # their files together.
+    out_dir = CALIBRATION_FOLDER_IMPORTS_DIR / f"{timestamp}_{suffix}"
+    os.makedirs(out_dir, exist_ok=False)
     for p in tif_paths:
         shutil.copy2(p, out_dir / os.path.basename(p))
     return str(out_dir)
@@ -1268,6 +1275,11 @@ def build_demo() -> gr.Blocks:
         # sys.stdout, so all three busy flags must be cross-checked by every one of the three
         # run-starting handlers (see the guards in run_handler, on_td_simulate, on_train_start).
         _train_run_state = {"stop_event": None, "busy": False}
+        # Guards the check-then-claim sequence ("is anything busy? if not, claim my own busy
+        # flag") in every one of the three start handlers above. Without this, two near-
+        # simultaneous clicks on two different tabs could both see all three flags False before
+        # either claims its own, and both worker threads would redirect sys.stdout at once.
+        _busy_lock = threading.Lock()
 
         # ── Handlers ─────────────────────────────────────────────────────────
 
@@ -1658,15 +1670,27 @@ def build_demo() -> gr.Blocks:
             # also blocks against a concurrent Generate Training Data run: both worker threads
             # redirect the process-global sys.stdout, which corrupts each other's log streams
             # (and each other's redirection) if they ever run at the same time.
-            if _run_state["busy"] or _td_run_state["busy"] or _train_run_state["busy"]:
+            with _busy_lock:
+                if _run_state["busy"] or _td_run_state["busy"] or _train_run_state["busy"]:
+                    busy_elsewhere = True
+                else:
+                    _run_state["busy"] = True
+                    busy_elsewhere = False
+            if busy_elsewhere:
+                # gr.skip() for this tab's own Start/Stop buttons, not gr.update(...) -- this
+                # branch fires even when a DIFFERENT tab is the one that's busy, in which case
+                # no worker starts here and nothing would ever re-enable run_btn afterward
+                # (previously this disabled run_btn/enabled stop_btn unconditionally, leaving
+                # run_btn stuck disabled -- and stop_btn an inert no-op -- until a page reload).
                 yield ("[ERROR] Another run (Phase Retrieval, Generate Training Data, or Train Model) "
                        "is already in progress.",
-                       gr.skip(), gr.update(interactive=False), gr.update(interactive=True), *no_results_change)
+                       gr.skip(), gr.skip(), gr.skip(), *no_results_change)
                 return
 
             try:
                 cfg = fields_to_config(*vals)
             except Exception as exc:
+                _run_state["busy"] = False  # release the claim -- bailing before any worker starts
                 yield (f"[CONFIG ERROR] {exc}", gr.skip(),
                        gr.update(interactive=True), gr.update(interactive=False), *no_results_change)
                 return
@@ -1679,7 +1703,6 @@ def build_demo() -> gr.Blocks:
             live_box: dict = {}
             stop_event = threading.Event()
             _run_state["stop_event"] = stop_event
-            _run_state["busy"] = True
 
             def _worker():
                 try:
@@ -1915,18 +1938,28 @@ def build_demo() -> gr.Blocks:
         def on_td_simulate(pr_results, out_dir, n_ims, *vals):
             # also blocks against a concurrent Run-tab phase retrieval — see the matching guard
             # in run_handler for why (shared sys.stdout redirection).
-            if _td_run_state["busy"] or _run_state["busy"] or _train_run_state["busy"]:
+            with _busy_lock:
+                if _td_run_state["busy"] or _run_state["busy"] or _train_run_state["busy"]:
+                    busy_elsewhere = True
+                else:
+                    _td_run_state["busy"] = True
+                    busy_elsewhere = False
+            if busy_elsewhere:
+                # gr.skip() for this tab's own Start/Stop buttons -- see run_handler's matching
+                # guard for why (this branch also fires when a DIFFERENT tab is the busy one).
                 yield ("[ERROR] Another run (Phase Retrieval, Generate Training Data, or Train Model) "
                        "is already in progress.",
-                       gr.update(interactive=False), gr.update(interactive=True))
+                       gr.skip(), gr.skip())
                 return
             if pr_results is None:
+                _td_run_state["busy"] = False
                 yield "[ERROR] Load Phase Retrieval Results first.", gr.update(interactive=True), gr.update(interactive=False)
                 return
             try:
                 cfg = fields_to_config(*vals)
                 param_dict = cfg.generate_training_param_dict(pr_results)
             except Exception as exc:
+                _td_run_state["busy"] = False
                 yield f"[CONFIG ERROR] {exc}", gr.update(interactive=True), gr.update(interactive=False)
                 return
 
@@ -1937,7 +1970,6 @@ def build_demo() -> gr.Blocks:
             run_error: list = [None]
             stop_event = threading.Event()
             _td_run_state["stop_event"] = stop_event
-            _td_run_state["busy"] = True
 
             def _worker():
                 try:
@@ -2000,12 +2032,21 @@ def build_demo() -> gr.Blocks:
             return meta, status
 
         def on_train_start(td_meta, *vals):
-            if _train_run_state["busy"] or _run_state["busy"] or _td_run_state["busy"]:
+            with _busy_lock:
+                if _train_run_state["busy"] or _run_state["busy"] or _td_run_state["busy"]:
+                    busy_elsewhere = True
+                else:
+                    _train_run_state["busy"] = True
+                    busy_elsewhere = False
+            if busy_elsewhere:
+                # gr.skip() for this tab's own Start/Stop buttons -- see run_handler's matching
+                # guard for why (this branch also fires when a DIFFERENT tab is the busy one).
                 yield ("[ERROR] Another run (Phase Retrieval, Generate Training Data, or Train Model) "
                        "is already in progress.", gr.skip(), gr.skip(),
-                       gr.update(interactive=False), gr.update(interactive=True))
+                       gr.skip(), gr.skip())
                 return
             if td_meta is None:
+                _train_run_state["busy"] = False
                 yield ("[ERROR] Load Training Data first.", gr.skip(), gr.skip(),
                        gr.update(interactive=True), gr.update(interactive=False))
                 return
@@ -2013,6 +2054,7 @@ def build_demo() -> gr.Blocks:
                 cfg = fields_to_config(*vals)
                 param_dict, training_dict = cfg.generate_training_run_dict(td_meta)
             except Exception as exc:
+                _train_run_state["busy"] = False
                 yield (f"[CONFIG ERROR] {exc}", gr.skip(), gr.skip(),
                        gr.update(interactive=True), gr.update(interactive=False))
                 return
@@ -2026,7 +2068,6 @@ def build_demo() -> gr.Blocks:
             live_box: dict = {}
             stop_event = threading.Event()
             _train_run_state["stop_event"] = stop_event
-            _train_run_state["busy"] = True
 
             def _worker():
                 try:

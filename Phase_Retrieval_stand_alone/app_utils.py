@@ -1114,7 +1114,12 @@ def estimate_signal_range(param_dict: dict, baseline_mu: float, exp_maxv: float,
             f"estimated photon count is non-positive ({p:.1f}) -- the marked bright-emitter "
             f"patch's peak ({exp_maxv:.1f}) isn't brighter than the marked baseline ({baseline_mu:.1f})"
         )
-    return round(0.5 * p / 1e3) * 1e3, round(1.1 * p / 1e3) * 1e3
+    # Rounding to the nearest integer photon (not the nearest 1000, as root's func3 does) --
+    # real single-molecule photon counts are often in the hundreds, and round(0.5*p/1e3)*1e3
+    # collapses anything below ~1000 photons to 0, which then makes Sampling.__init__ divide by
+    # zero (`blob_maxv / Nsig_range[1]`). p is already guarded > 0 above, so rounding to the
+    # nearest integer can never produce exactly 0 for a genuinely positive signal.
+    return round(0.5 * p), round(1.1 * p)
 
 
 def _simulate_one_frame(model, sampling, param_dict):
@@ -1181,10 +1186,33 @@ def generate_training_data(param_dict: dict, out_dir: str, n_ims: int, stop_even
     ]
     start_i = max(existing_indices) + 1 if existing_indices else 0
 
+    H, W = param_dict['H'], param_dict['W']
+    new_metadata = {
+        'volume_size': (param_dict['D'], param_dict['HH'], param_dict['WW']),
+        'us_factor': param_dict['us_factor'],
+        'blob_r': param_dict['blob_r'],
+        'blob_maxv': param_dict['blob_maxv'],
+        'tile_grid': (1, 1),
+        'camera_size_px': (H, W),
+    }
+
     if existing_indices and os.path.isfile(y_pickle_path):
         with open(y_pickle_path, "rb") as f:
             labels_dict = pickle.load(f)
-        print(f"[TD] {x_dir} already has {len(existing_indices)} frame(s) -- "
+        # Earlier frames' xyz_ids/blob3d were computed under whatever settings produced THIS
+        # metadata -- silently overwriting it with the current run's settings would desync
+        # those labels from the volume they actually describe (and a differing camera_size_px
+        # means the earlier frames are even a different pixel size than the new ones). Refuse
+        # rather than silently corrupt; the user can pick a fresh output folder instead.
+        existing_metadata = {k: labels_dict.get(k) for k in new_metadata}
+        if existing_metadata != new_metadata:
+            raise ValueError(
+                f"{out_dir} already has {len(existing_indices)} frame(s) generated with "
+                f"different settings than the current configuration -- appending here would "
+                f"desync their ground truth.\n  existing: {existing_metadata}\n  current:  {new_metadata}\n"
+                f"Use a different output folder, or regenerate this one from scratch."
+            )
+        print(f"[TD] {x_dir} already has {len(existing_indices)} frame(s) with matching settings -- "
               f"appending new frames starting at {start_i:05d}.tif.")
     elif existing_indices:
         labels_dict = {}
@@ -1196,16 +1224,7 @@ def generate_training_data(param_dict: dict, out_dir: str, n_ims: int, stop_even
 
     model = ImModelTraining(param_dict)
     sampling = Sampling(param_dict)
-    H, W = param_dict['H'], param_dict['W']
-
-    labels_dict.update({
-        'volume_size': (param_dict['D'], param_dict['HH'], param_dict['WW']),
-        'us_factor': param_dict['us_factor'],
-        'blob_r': param_dict['blob_r'],
-        'blob_maxv': param_dict['blob_maxv'],
-        'tile_grid': (1, 1),
-        'camera_size_px': (H, W),
-    })
+    labels_dict.update(new_metadata)
 
     n_ims = int(n_ims)
     written = 0
@@ -1278,6 +1297,9 @@ def maybe_build_x_memmap(td_folder, force_rebuild=False):
             im = io.imread(os.path.join(x_folder, fname))
             if im.shape != (H, W):
                 raise ValueError(f'Image shape mismatch for {fname}: {im.shape} vs {(H, W)}')
+            if im.dtype != dtype:
+                raise ValueError(f'Image dtype mismatch for {fname}: {im.dtype} vs {dtype} -- '
+                                  f'packing it into the shared memmap would silently cast/rescale its values.')
             X[i] = im
         X.flush()
         np.save(ids_path, np.array(ids, dtype=object), allow_pickle=True)
@@ -1372,7 +1394,14 @@ def _make_post_epoch_fn(live_box, validate_ds, param_dict, t0, sample_viz_every_
     device = param_dict['device']
     train_loss_history, test_loss_history, lr_history = [], [], []
 
-    viz_x, viz_y = validate_ds[0]
+    # Defensive even though train_model() already passes a non-empty dataset here (falling
+    # back to a train-partition sample when the validation split is empty) -- this function's
+    # own docstring promises "never raises", so guard again rather than rely solely on the
+    # caller getting that right.
+    if len(validate_ds) > 0:
+        viz_x, viz_y = validate_ds[0]
+    else:
+        viz_x = viz_y = None
     volume2xyz = None
     try:
         volume2xyz = Volume2XYZ(params={
@@ -1399,7 +1428,7 @@ def _make_post_epoch_fn(live_box, validate_ds, param_dict, t0, sample_viz_every_
         avg_epoch_s = snapshot['elapsed_s'] / max(epoch, 1)
         snapshot['eta_s'] = avg_epoch_s * max(total_epochs - epoch, 0)
 
-        if is_best or (sample_viz_every_epochs > 0 and epoch % sample_viz_every_epochs == 0):
+        if viz_x is not None and (is_best or (sample_viz_every_epochs > 0 and epoch % sample_viz_every_epochs == 0)):
             try:
                 model.eval()
                 with torch.no_grad():
@@ -1428,8 +1457,14 @@ def _make_post_epoch_fn(live_box, validate_ds, param_dict, t0, sample_viz_every_
                 model.train()
 
         if live_box is not None:
+            # Bump version as part of the SAME snapshot dict rather than a second, separate
+            # live_box mutation afterward -- the GUI polling thread reads live_box concurrently,
+            # and a reader landing between two separate top-level writes could see a torn state
+            # (e.g. train_loss_history already updated but test_loss_history not yet, or version
+            # bumped before the new histories are actually in place). One dict with everything,
+            # applied via one update() call, shrinks that window.
+            snapshot['version'] = live_box.get('version', 0) + 1
             live_box.update(snapshot)
-            live_box['version'] = live_box.get('version', 0) + 1
 
     return post_epoch_fn
 
@@ -1441,8 +1476,8 @@ def train_model(param_dict: dict, training_dict: dict, live_box: dict = None, st
     support and a live_box progress-snapshot mechanism (see _make_post_epoch_fn) on top --
     neither changes the training math itself.
     Returns (net_file, fit_file), matching root's own training_func()."""
-    np.random.seed(training_dict.get('numpy_seed', 66))
-    torch.manual_seed(training_dict.get('torch_seed', 88))
+    np.random.seed(training_dict['numpy_seed'])
+    torch.manual_seed(training_dict['torch_seed'])
 
     device = torch.device(param_dict['device'])
     print(f'device used (train_model): {device}')
@@ -1455,7 +1490,7 @@ def train_model(param_dict: dict, training_dict: dict, live_box: dict = None, st
     batch_size = training_dict['batch_size']
     lr = training_dict['lr']
     num_epochs = training_dict['num_epochs']
-    num_workers = training_dict.get('num_workers', 0)
+    num_workers = training_dict['num_workers']
 
     params_train = dict(batch_size=batch_size, num_workers=num_workers,
                          pin_memory=(device.type == 'cuda'))
@@ -1471,12 +1506,12 @@ def train_model(param_dict: dict, training_dict: dict, live_box: dict = None, st
     with open(os.path.join(td_folder, 'y.pickle'), 'rb') as handle:
         labels = pickle.load(handle)
 
-    if training_dict.get('shuffle_split', False):
-        rng = np.random.RandomState(training_dict.get('numpy_seed', 66))
+    if training_dict['shuffle_split']:
+        rng = np.random.RandomState(training_dict['numpy_seed'])
         x_list = list(x_list)
         rng.shuffle(x_list)
 
-    split = training_dict.get('train_val_split', 0.9)
+    split = training_dict['train_val_split']
     partition = {'train': x_list[:int(num_x * split)], 'validate': x_list[int(num_x * split):]}
     train_ds = MyDataset(x_folder, partition['train'], labels, cache_info=x_cache)
     validate_ds = MyDataset(x_folder, partition['validate'], labels, cache_info=x_cache)
@@ -1486,7 +1521,7 @@ def train_model(param_dict: dict, training_dict: dict, live_box: dict = None, st
 
     D, us_factor, maxv = labels['volume_size'][0], labels['us_factor'], labels['blob_maxv']
 
-    resume_file = training_dict.get('resume_net_file', None)
+    resume_file = training_dict['resume_net_file']
     if resume_file == 'None':
         resume_file = None
 
@@ -1508,6 +1543,12 @@ def train_model(param_dict: dict, training_dict: dict, live_box: dict = None, st
         resume_checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
 
         state_dict = resume_checkpoint.get('model_state_dict', resume_checkpoint.get('state_dict'))
+        if state_dict is None:
+            raise ValueError(
+                f"{ckpt_path} doesn't look like a checkpoint this app wrote -- missing both "
+                f"'model_state_dict' and 'state_dict'. Point 'Resume from checkpoint' at a "
+                f"net_*.pt/last_net_*.pt file from this Train Model tab."
+            )
         model.load_state_dict(state_dict)
 
         if resume_checkpoint.get('optimizer_state_dict') is not None:
@@ -1612,18 +1653,24 @@ def train_model(param_dict: dict, training_dict: dict, live_box: dict = None, st
     )
 
     # cache one validation tile's GT voxel-index positions for the debug panel's Jaccard readout
+    # -- fall back to a train-partition sample when the validation split is empty, and use the
+    # matching DATASET object too (previously only viz_id had this fallback; _make_post_epoch_fn
+    # was always handed validate_ds, which would itself be empty and crash on validate_ds[0]).
     param_dict = dict(param_dict)
-    viz_id = partition['validate'][0] if partition['validate'] else partition['train'][0]
+    if partition['validate']:
+        viz_id, viz_ds = partition['validate'][0], validate_ds
+    else:
+        viz_id, viz_ds = partition['train'][0], train_ds
     param_dict['_viz_xyz_ids'] = labels[viz_id][0]
 
     t0 = time.time()
     post_epoch_fn = _make_post_epoch_fn(
-        live_box, validate_ds, param_dict, t0,
-        training_dict.get('sample_viz_every_epochs', 5),
+        live_box, viz_ds, param_dict, t0,
+        training_dict['sample_viz_every_epochs'],
     )
     fit_results = trainer.fit(
         train_dl, validate_dl, num_epochs=num_epochs, checkpoints=checkpoints,
-        early_stopping=training_dict.get('early_stopping', 15),
+        early_stopping=training_dict['early_stopping'],
         start_epoch=start_epoch, history=history, best_metric=best_metric,
         epochs_without_improvement=epochs_without_improvement,
         post_epoch_fn=post_epoch_fn, stop_event=stop_event,
