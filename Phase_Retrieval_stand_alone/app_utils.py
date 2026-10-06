@@ -1245,13 +1245,18 @@ def _simulate_one_frame(model, sampling, param_dict, tile_center=None):
         pr0, pc0 = rr0 - (r - pr_lo), cc0 - (c - pc_lo)
         canvas[rr0:rr1, cc0:cc1] += patch[pr0:pr0 + (rr1 - rr0), pc0:pc0 + (cc1 - cc0)]
 
+    im = _add_camera_noise(canvas, param_dict)
+    return im, xyz_ids, blob3d
+
+
+def _add_camera_noise(canvas: np.ndarray, param_dict: dict) -> np.ndarray:
     bg_lo, bg_hi = param_dict['shot_noise_background_range']
     off_lo, off_hi = param_dict['noise_offset_range']
     background = float(np.random.uniform(bg_lo, bg_hi)) ** 2
     offset = float(np.random.uniform(off_lo, off_hi))
-    im = np.abs(np.random.poisson(canvas + background) + offset - background)
-    im = np.clip(im, 0, 2 ** param_dict['bitdepth'] - 1).astype(np.uint16)
-    return im, xyz_ids, blob3d
+    noise = np.random.poisson(np.full_like(canvas, background)) - background
+    im = np.abs(canvas + noise + offset)
+    return np.clip(im, 0, 2 ** param_dict['bitdepth'] - 1).astype(np.uint16)
 
 
 def generate_training_frames(param_dict: dict, n: int, tile_center=None) -> list:
