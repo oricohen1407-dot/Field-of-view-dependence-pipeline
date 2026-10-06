@@ -1053,68 +1053,76 @@ def load_phase_retrieval_results(results_dir: str):
     }
 
 
-def list_experimental_data_files(folder: str) -> list:
-    """Cheap existence/content check for an experimental-data folder: lists (sorted)
-    .tif/.tiff FILENAMES only, without reading any of them. Raises FileNotFoundError if
-    `folder` isn't a folder accessible from this server, or ValueError if it has no .tif/.tiff
-    files -- both callable right after the user enters a path, before committing to actually
-    sampling/reading anything."""
-    if not os.path.isdir(folder):
-        raise FileNotFoundError(f"'{folder}' is not a folder accessible from this server.")
-    names = sorted(f for f in os.listdir(folder) if f.lower().endswith(('.tif', '.tiff')))
-    if not names:
-        raise ValueError(f"No .tif/.tiff files found in '{folder}'.")
-    return names
+def list_experimental_data_file_info(path: str) -> int:
+    """Cheap existence/content check for a single experimental-data TIFF file: opens it via
+    tifffile.TiffFile, which reads only the page directory/metadata, not any pixel data, and
+    returns its page (frame) count. Raises FileNotFoundError if `path` isn't a file accessible
+    from this server, or ValueError if it can't be read as a TIFF / has zero pages -- both
+    callable right after the user enters a path, before committing to actually sampling/reading
+    any frame data."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"'{path}' is not a file accessible from this server.")
+    try:
+        with tifffile.TiffFile(path) as tif:
+            n_pages = len(tif.pages)
+    except Exception as exc:
+        raise ValueError(f"'{path}' could not be read as a TIFF file: {exc}")
+    if n_pages == 0:
+        raise ValueError(f"'{path}' contains no pages/frames.")
+    return n_pages
 
 
-def sample_experimental_frames(folder: str, n_samples: int, attempts: int = 8, base_delay: float = 0.25) -> dict:
-    """Lists `folder` (sorted .tif/.tiff filenames only -- cheap) and reads just an evenly-spaced
-    SUBSAMPLE of up to n_samples of those files into memory. The real experimental dataset this
-    points at lives on the server hosting the GUI and can be huge (thousands of frames), so this
-    must never read the whole folder -- only the sampled subset ever touches memory.
+def sample_experimental_frames(path: str, n_samples: int, attempts: int = 8, base_delay: float = 0.25) -> dict:
+    """Opens the single TIFF file at `path` (tifffile.TiffFile -- reads only its page
+    directory, not pixel data) and reads just an evenly-spaced SUBSAMPLE of up to n_samples of
+    its pages (frames) into memory. The real experimental dataset this points at lives on the
+    server hosting the GUI and can be huge (thousands of frames in one file), so this must
+    never read the whole file -- only the sampled subset of pages ever touches memory.
 
-    Each sampled file may itself be a multi-page TIFF; those pages become that sample's own Z
-    axis (browsed independently per-sample), while the returned T axis indexes across the
-    SAMPLED files themselves -- genuine time, unlike treating one file's own Z-slices as if they
-    were time. Retries on PermissionError, same rationale as gui.py's _read_tiff_with_retry: a
-    file still being written by a live acquisition can be transiently locked."""
-    names = list_experimental_data_files(folder)
-    n_samples = max(1, min(int(n_samples), len(names)))
-    idxs = sorted(set(np.linspace(0, len(names) - 1, n_samples).round().astype(int).tolist()))
-    sampled_names = [names[i] for i in idxs]
+    Each returned sample is one page (a TIFF page is always a flat 2D plane), and the returned
+    T axis indexes across the SAMPLED pages themselves -- genuine time within this one file.
+    Retries opening the file on PermissionError, same rationale as gui.py's
+    _read_tiff_with_retry: a file still being written by a live acquisition can be transiently
+    locked."""
+    n_pages = list_experimental_data_file_info(path)
+    n_samples = max(1, min(int(n_samples), n_pages))
+    idxs = sorted(set(np.linspace(0, n_pages - 1, n_samples).round().astype(int).tolist()))
+
+    last_exc = None
+    tif = None
+    for attempt in range(attempts):
+        try:
+            tif = tifffile.TiffFile(path)
+            break
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(base_delay * (attempt + 1))
+    if tif is None:
+        raise last_exc
 
     arrays = []
     ref_hw = None
-    for name in sampled_names:
-        path = os.path.join(folder, name)
-        arr, last_exc = None, None
-        for attempt in range(attempts):
-            try:
-                arr = tifffile.imread(path)
-                break
-            except PermissionError as exc:
-                last_exc = exc
-                time.sleep(base_delay * (attempt + 1))
-        if arr is None:
-            raise last_exc
-        if arr.ndim == 2:
-            arr = arr[None, ...]
-        elif arr.ndim != 3:
-            raise ValueError(f"'{name}': expected a 2D or 3D (Z,H,W) TIFF, got shape {arr.shape}.")
-        if ref_hw is None:
-            ref_hw = arr.shape[1:]
-        elif arr.shape[1:] != ref_hw:
-            raise ValueError(
-                f"'{name}' is {arr.shape[1:]}, but the first sampled frame '{sampled_names[0]}' "
-                f"is {ref_hw} -- all sampled frames must be the same size."
-            )
-        arrays.append(arr.astype(np.float32))
+    try:
+        for idx in idxs:
+            arr = tif.pages[idx].asarray()
+            if arr.ndim != 2:
+                raise ValueError(f"page {idx} of '{path}': expected a flat 2D frame, got shape {arr.shape}.")
+            if ref_hw is None:
+                ref_hw = arr.shape
+            elif arr.shape != ref_hw:
+                raise ValueError(
+                    f"page {idx} is {arr.shape}, but page {idxs[0]} is {ref_hw} -- all sampled "
+                    f"frames must be the same size."
+                )
+            arrays.append(arr.astype(np.float32))
+    finally:
+        tif.close()
 
     vmin = min(float(a.min()) for a in arrays)
     vmax = max(float(a.max()) for a in arrays)
     return {
-        "arrays": arrays, "names": sampled_names, "vmin": vmin, "vmax": vmax,
-        "T": len(arrays), "total_files_in_folder": len(names),
+        "arrays": arrays, "indices": idxs, "vmin": vmin, "vmax": vmax,
+        "T": len(arrays), "total_pages_in_file": n_pages,
     }
 
 

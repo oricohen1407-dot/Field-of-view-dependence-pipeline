@@ -105,8 +105,8 @@ class TrainingDataConfig:
     noise_offset_range: str = "0, 0"       # additive dark/readout offset
 
     # --- Experimental-data sampling (SNR calibration) — appended, keeps every index above stable ---
-    experimental_data_dir: str = ""        # folder of real-data frames, accessible from the HOSTING SERVER, not the browser's machine
-    snr_subsample_frames: int = 10         # how many frames to read from that folder (never the whole folder)
+    experimental_data_file: str = ""       # path to a single multi-page TIFF of real-data frames, accessible from the HOSTING SERVER, not the browser's machine
+    snr_subsample_frames: int = 10         # how many frames (pages) to read from that file (never the whole file)
 
 
 @dataclass
