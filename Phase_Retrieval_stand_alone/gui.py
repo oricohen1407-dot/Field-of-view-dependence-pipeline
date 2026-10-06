@@ -635,7 +635,7 @@ def _opt_str(v):
 
 
 def config_to_fields(cfg: Config) -> list:
-    """Flatten a Config into the ordered list of Gradio field values (78 items)."""
+    """Flatten a Config into the ordered list of Gradio field values (80 items)."""
     u, a, t, tr = cfg.user, cfg.advanced, cfg.training, cfg.training_run
     sig_lo, sig_hi = (float(x) for x in t.signal_range.split(','))
     bg_lo, bg_hi = (float(x) for x in t.background_range.split(','))
@@ -694,6 +694,8 @@ def config_to_fields(cfg: Config) -> list:
         tr.batch_size, tr.learning_rate, tr.early_stopping_patience,
         tr.train_val_split, tr.shuffle_train_val_split, tr.num_workers,
         tr.numpy_seed, tr.torch_seed, tr.sample_viz_every_epochs, tr.viz_threshold,
+        # ── Generate Training Data — experimental-data sampling — appended, keeps every index above stable ──
+        t.experimental_data_dir, t.snr_subsample_frames,
     ]
 
 
@@ -734,6 +736,8 @@ def fields_to_config(
     train_data_dir, train_ckpt_dir, train_device, train_resume_ckpt, train_num_epochs,
     train_batch_size, train_lr, train_early_stopping, train_val_split, train_shuffle_split,
     train_num_workers, train_numpy_seed, train_torch_seed, train_sample_viz_every, train_viz_threshold,
+    # Generate Training Data — experimental-data sampling (2)
+    td_exp_data_dir, td_snr_subsample_frames,
 ) -> Config:
     """Parse ordered Gradio field values back into a Config object."""
     offaxis_files = [
@@ -799,6 +803,8 @@ def fields_to_config(
             blob_sigma=float(td_blob_sigma),
             blob_maxv=int(float(td_blob_maxv)),
             noise_offset_range=f"{float(td_noise_off_min)}, {float(td_noise_off_max)}",
+            experimental_data_dir=str(td_exp_data_dir).strip(),
+            snr_subsample_frames=int(float(td_snr_subsample_frames)),
         ),
         training_run=TrainingRunConfig(
             training_data_dir=str(train_data_dir).strip(),
@@ -1089,14 +1095,34 @@ def build_demo() -> gr.Blocks:
                 td_pr_results_state = gr.State(initial_pr_results)
 
                 gr.Markdown(
-                    "### 2. Upload an experimental frame and mark two reference regions\n"
+                    "### 2. Sample frames from your experimental data and mark two reference regions\n"
+                    "**Enter a folder path that is accessible from the machine hosting this GUI "
+                    "(the server) — not a path on your own computer.** The full experimental "
+                    "dataset is typically far too large to upload through the browser, and "
+                    "Inference will read directly from this same folder later anyway, so this "
+                    "tab points at it in place instead of uploading a copy. Only a small, "
+                    "evenly-spaced **subsample** of frames is ever read into memory here — never "
+                    "the whole folder.\n\n"
                     "Mark a **no-emitter** patch (baseline/noise) and a **bright emitter** patch "
-                    "(peak signal) — together they calibrate Background, Noise offset, and Signal "
-                    "against your real data, mirroring how the root pipeline's SNR-characterization "
-                    "step works."
+                    "(peak signal) on the displayed frame — together they calibrate Background, "
+                    "Noise offset, and Signal against your real data, mirroring how the root "
+                    "pipeline's SNR-characterization step works."
                 )
                 with gr.Row(equal_height=True):
-                    td_frame_upload = gr.File(label="Experimental frame (.tif)", file_count="single")
+                    td_exp_data_dir = gr.Textbox(
+                        label="Experimental data folder (path on the server hosting this GUI)",
+                        value=defaults[78],
+                    )
+                    td_subsample_n = gr.Number(
+                        label="Frames to subsample", value=defaults[79], precision=0,
+                    )
+                with gr.Row(equal_height=True):
+                    td_sample_btn = gr.Button("Sample Frames")
+                    td_sample_status = gr.Textbox(
+                        show_label=False, interactive=False,
+                        placeholder="Click to read an evenly-spaced subsample of frames from the folder above.",
+                    )
+                with gr.Row(equal_height=True):
                     with gr.Column():
                         td_mark_mode = gr.Radio(
                             ["No-emitter region (baseline)", "Bright emitter (peak signal)"],
@@ -1109,15 +1135,19 @@ def build_demo() -> gr.Blocks:
                         td_noise_h = gr.Number(
                             label="Marked-patch height (px)", value=40, precision=0, elem_id="td_noise_h",
                         )
-                td_z_slider = gr.Slider(label="Z-slice (browse)", minimum=0, maximum=1, step=1, value=0)
+                with gr.Row(equal_height=True):
+                    td_t_slider = gr.Slider(label="T (sampled frame, browse)", minimum=0, maximum=1, step=1, value=0)
+                    td_z_slider = gr.Slider(label="Z-slice (within this frame, browse)", minimum=0, maximum=1, step=1, value=0)
                 td_estimate_mode = gr.Radio(
-                    ["Current Z-slice", "Across all loaded frames (temporal)"],
-                    value="Current Z-slice", label="Estimate noise/peak from",
+                    ["Current frame", "Across all sampled frames (temporal)"],
+                    value="Current frame", label="Estimate noise/peak from",
                     info="Temporal: baseline mean/std come from the single darkest-mean pixel's "
-                         "own value over every loaded frame (isolates real per-pixel noise from "
-                         "spatial non-uniformity); peak is the max over the whole stack in the "
-                         "marked emitter box (catches a blinking emitter automatically). Mirrors "
-                         "the method already used in the AutoDS3D/root pipeline's SNR step.",
+                         "own value over every SAMPLED frame (T) at the current Z (isolates real "
+                         "per-pixel noise from spatial non-uniformity); peak is the max over every "
+                         "sampled frame in the marked emitter box (catches a blinking emitter "
+                         "automatically). Mirrors the method already used in the AutoDS3D/root "
+                         "pipeline's SNR step — now genuinely temporal, since T indexes separate "
+                         "sampled files rather than one file's own Z-slices.",
                 )
                 td_frame_state = gr.State(None)
                 td_noise_bbox_state = gr.State(None)
@@ -1128,7 +1158,7 @@ def build_demo() -> gr.Blocks:
                 )
                 td_noise_status = gr.Textbox(
                     show_label=False, interactive=False,
-                    placeholder="Upload a frame, then mark both a no-emitter and a bright-emitter region.",
+                    placeholder="Sample frames above, then mark both a no-emitter and a bright-emitter region.",
                 )
 
                 gr.Markdown("### 3. Parameters — adjust, then Update Preview")
@@ -1260,6 +1290,7 @@ def build_demo() -> gr.Blocks:
             train_data_dir, train_ckpt_dir, train_device, train_resume_ckpt, train_num_epochs,
             train_batch_size, train_lr, train_early_stopping, train_val_split, train_shuffle_split,
             train_num_workers, train_numpy_seed, train_torch_seed, train_sample_viz_every, train_viz_threshold,
+            td_exp_data_dir, td_subsample_n,
         ]
 
         # microscope preset fields, in the fixed order used by microscopes.json entries
@@ -1794,36 +1825,39 @@ def build_demo() -> gr.Blocks:
         def on_td_load_pr():
             return _load_pr_results_and_status()
 
-        def on_td_frame_uploaded(file_path):
-            no_z = gr.update(minimum=0, maximum=1, value=0)
-            if not file_path:
-                return None, None, None, None, "No file selected.", no_z
-            try:
-                arr = _read_tiff_with_retry(file_path)
-            except Exception as exc:
-                return None, None, None, None, f"[ERROR] Could not read {file_path}: {exc}", no_z
-            if arr.ndim == 2:
-                arr = arr[None, ...]
-            elif arr.ndim != 3:
+        def on_td_sample_frames(folder, n_samples):
+            no_slider = gr.update(minimum=0, maximum=1, value=0)
+            if not folder or not str(folder).strip():
                 return (None, None, None, None,
-                        f"[ERROR] Expected a 2D (or 3D Z-stack) TIFF, got shape {arr.shape}.", no_z)
-            Z = arr.shape[0]
-            vmin, vmax = float(arr.min()), float(arr.max())
-            frame_state = {"array": arr, "vmin": vmin, "vmax": vmax, "Z": Z}
-            mid_z = Z // 2
-            rgb = _render_td_marks(frame_state, mid_z, None, None)
-            # gr.Slider requires minimum < maximum strictly -- a single-frame (Z=1) upload,
-            # which is a normal/expected input here (a plain experimental frame, not
-            # necessarily a stack), would otherwise crash with maximum=0=minimum.
-            z_update = gr.update(minimum=0, maximum=max(Z - 1, 1), value=mid_z, step=1, interactive=Z > 1)
-            return (frame_state, None, None, rgb,
-                    "Frame loaded — mark a no-emitter region and a bright-emitter region. "
-                    "Use Z-slice to browse other frames of the stack (e.g. to catch a blinking emitter).",
-                    z_update)
+                        "Enter an experimental data folder path (on the server hosting this GUI) first.",
+                        no_slider, no_slider)
+            try:
+                sample = app_utils.sample_experimental_frames(str(folder).strip(), n_samples)
+            except Exception as exc:
+                return None, None, None, None, f"[ERROR] {exc}", no_slider, no_slider
+            frame_state = sample
+            mid_t = sample["T"] // 2
+            z_depth = sample["arrays"][mid_t].shape[0]
+            mid_z = z_depth // 2
+            rgb = _render_td_marks(frame_state, mid_t, mid_z, None, None)
+            # gr.Slider requires minimum < maximum strictly -- a single sampled frame (T=1) or a
+            # flat 2D file (Z=1) are both normal/expected here, which would otherwise crash with
+            # maximum=0=minimum.
+            t_update = gr.update(minimum=0, maximum=max(sample["T"] - 1, 1), value=mid_t, step=1,
+                                  interactive=sample["T"] > 1)
+            z_update = gr.update(minimum=0, maximum=max(z_depth - 1, 1), value=mid_z, step=1,
+                                  interactive=z_depth > 1)
+            status = (f"Sampled {sample['T']} of {sample['total_files_in_folder']} file(s) in "
+                      f"'{folder}'. Mark a no-emitter region and a bright-emitter region. Use T "
+                      f"to browse sampled frames (files) and Z to browse within one frame's own "
+                      f"pages, if it has more than one.")
+            return frame_state, None, None, rgb, status, t_update, z_update
 
-        def _render_td_marks(frame_state, z, noise_bbox, emitter_bbox):
-            z = max(0, min(int(z), frame_state["Z"] - 1))
-            gray = _normalize_slice(frame_state["array"][z], frame_state["vmin"], frame_state["vmax"])
+        def _render_td_marks(frame_state, t, z, noise_bbox, emitter_bbox):
+            t = max(0, min(int(t), frame_state["T"] - 1))
+            arr3 = frame_state["arrays"][t]
+            z = max(0, min(int(z), arr3.shape[0] - 1))
+            gray = _normalize_slice(arr3[z], frame_state["vmin"], frame_state["vmax"])
             rgb = np.stack([gray, gray, gray], axis=-1).copy()
             if noise_bbox is not None:
                 _draw_box(rgb, noise_bbox, _PENDING_BOX_COLOR)
@@ -1831,28 +1865,41 @@ def build_demo() -> gr.Blocks:
                 _draw_box(rgb, emitter_bbox, _TD_EMITTER_BOX_COLOR)
             return rgb
 
-        def on_td_z_slider_change(z, frame_state, noise_bbox, emitter_bbox):
+        def on_td_t_slider_change(t, z, frame_state, noise_bbox, emitter_bbox):
+            if not frame_state:
+                return gr.skip(), gr.skip()
+            t = max(0, min(int(t), frame_state["T"] - 1))
+            z_depth = frame_state["arrays"][t].shape[0]
+            z_clamped = max(0, min(int(z), z_depth - 1))
+            z_update = gr.update(minimum=0, maximum=max(z_depth - 1, 1), value=z_clamped,
+                                  interactive=z_depth > 1)
+            rgb = _render_td_marks(frame_state, t, z_clamped, noise_bbox, emitter_bbox)
+            return rgb, z_update
+
+        def on_td_z_slider_change(t, z, frame_state, noise_bbox, emitter_bbox):
             if not frame_state:
                 return gr.skip()
-            return _render_td_marks(frame_state, z, noise_bbox, emitter_bbox)
+            return _render_td_marks(frame_state, t, z, noise_bbox, emitter_bbox)
 
-        def on_td_frame_click(evt: gr.SelectData, frame_state, w, h, mode, estimate_mode, z,
+        def on_td_frame_click(evt: gr.SelectData, frame_state, w, h, mode, estimate_mode, t, z,
                                noise_bbox, emitter_bbox, pr_results, *vals):
             no_seed = (gr.skip(),) * 6
             if not frame_state:
-                return gr.skip(), gr.skip(), gr.skip(), "Upload an experimental frame first.", *no_seed
+                return gr.skip(), gr.skip(), gr.skip(), "Sample experimental frames first.", *no_seed
             if w is None or h is None or float(w) <= 0 or float(h) <= 0:
                 return (gr.skip(), gr.skip(), gr.skip(),
                         "Enter a positive marked-patch width/height first.", *no_seed)
-            z = max(0, min(int(z), frame_state["Z"] - 1))
-            arr = frame_state["array"][z]
+            t = max(0, min(int(t), frame_state["T"] - 1))
+            arr3 = frame_state["arrays"][t]
+            z = max(0, min(int(z), arr3.shape[0] - 1))
+            arr = arr3[z]
             col, row = int(evt.index[0]), int(evt.index[1])
             H, W = arr.shape
             bbox = _crop_window_rect(row, col, int(w), int(h), H, W)
             is_noise_mode = mode.startswith("No-emitter")
             noise_bbox = bbox if is_noise_mode else noise_bbox
             emitter_bbox = bbox if not is_noise_mode else emitter_bbox
-            rgb = _render_td_marks(frame_state, z, noise_bbox, emitter_bbox)
+            rgb = _render_td_marks(frame_state, t, z, noise_bbox, emitter_bbox)
 
             if noise_bbox is None or emitter_bbox is None:
                 missing = "a bright-emitter region" if noise_bbox is not None else "a no-emitter region"
@@ -1870,11 +1917,13 @@ def build_demo() -> gr.Blocks:
             is_temporal = estimate_mode is not None and estimate_mode.startswith("Across all")
             if is_temporal:
                 # AutoDS3D/root's mu_std_p method: baseline from the single darkest-mean pixel's
-                # own value over every loaded frame; peak from the max over every frame in the
-                # marked emitter box (catches a blinking emitter without needing the exact best
-                # Z-slice to already be the one marked).
-                mean, std = app_utils.temporal_noise_baseline(frame_state["array"], noise_bbox)
-                exp_maxv = app_utils.temporal_peak(frame_state["array"], emitter_bbox)
+                # own value over every frame; peak from the max over every frame in the marked
+                # emitter box (catches a blinking emitter without needing the exact best frame to
+                # already be the one marked). T is the genuine across-SAMPLED-FILES time axis
+                # here, at the currently browsed Z, rather than one file's own Z-slices.
+                t_stack = np.stack([a[min(z, a.shape[0] - 1)] for a in frame_state["arrays"]])
+                mean, std = app_utils.temporal_noise_baseline(t_stack, noise_bbox)
+                exp_maxv = app_utils.temporal_peak(t_stack, emitter_bbox)
             else:
                 mean, std = app_utils.noise_patch_stats(arr, noise_bbox)
                 er0, er1, ec0, ec1 = emitter_bbox
@@ -1908,7 +1957,7 @@ def build_demo() -> gr.Blocks:
             return (noise_bbox, emitter_bbox, rgb, status,
                     bg_min, bg_max, off_min, off_max, sig_min, sig_max)
 
-        def on_td_update_preview(pr_results, frame_state, z, *vals):
+        def on_td_update_preview(pr_results, frame_state, t, z, *vals):
             if pr_results is None:
                 return None, "Load Phase Retrieval Results first."
             try:
@@ -1925,10 +1974,12 @@ def build_demo() -> gr.Blocks:
             axes = [axes] if n_panels == 1 else list(axes)
             idx = 0
             if frame_state:
-                zc = max(0, min(int(z), frame_state["Z"] - 1))
-                arr = frame_state["array"][zc]
+                tc = max(0, min(int(t), frame_state["T"] - 1))
+                arr3 = frame_state["arrays"][tc]
+                zc = max(0, min(int(z), arr3.shape[0] - 1))
+                arr = arr3[zc]
                 axes[idx].imshow(arr, cmap="gray", vmin=frame_state["vmin"], vmax=frame_state["vmax"])
-                axes[idx].set_title(f"experimental frame (z={zc})")
+                axes[idx].set_title(f"experimental frame (t={tc}, z={zc})")
                 axes[idx].axis("off")
                 idx += 1
             axes[idx].imshow(sim, cmap="gray")
@@ -2211,26 +2262,32 @@ def build_demo() -> gr.Blocks:
             outputs=[results_dropdown, results_image, results_plot, results_status],
         )
         td_load_pr_btn.click(fn=on_td_load_pr, outputs=[td_pr_results_state, td_pr_status])
-        td_frame_upload.upload(
-            fn=on_td_frame_uploaded, inputs=[td_frame_upload],
+        td_sample_btn.click(
+            fn=on_td_sample_frames, inputs=[td_exp_data_dir, td_subsample_n],
             outputs=[td_frame_state, td_noise_bbox_state, td_emitter_bbox_state,
-                     td_frame_image, td_noise_status, td_z_slider],
+                     td_frame_image, td_sample_status, td_t_slider, td_z_slider],
+        )
+        td_t_slider.change(
+            fn=on_td_t_slider_change,
+            inputs=[td_t_slider, td_z_slider, td_frame_state, td_noise_bbox_state, td_emitter_bbox_state],
+            outputs=[td_frame_image, td_z_slider],
         )
         td_z_slider.change(
             fn=on_td_z_slider_change,
-            inputs=[td_z_slider, td_frame_state, td_noise_bbox_state, td_emitter_bbox_state],
+            inputs=[td_t_slider, td_z_slider, td_frame_state, td_noise_bbox_state, td_emitter_bbox_state],
             outputs=[td_frame_image],
         )
         td_frame_image.select(
             fn=on_td_frame_click,
-            inputs=[td_frame_state, td_noise_w, td_noise_h, td_mark_mode, td_estimate_mode, td_z_slider,
+            inputs=[td_frame_state, td_noise_w, td_noise_h, td_mark_mode, td_estimate_mode,
+                    td_t_slider, td_z_slider,
                     td_noise_bbox_state, td_emitter_bbox_state, td_pr_results_state] + all_fields,
             outputs=[td_noise_bbox_state, td_emitter_bbox_state, td_frame_image, td_noise_status,
                      td_bg_min, td_bg_max, td_noise_off_min, td_noise_off_max, td_sig_min, td_sig_max],
         )
         td_update_preview_btn.click(
             fn=on_td_update_preview,
-            inputs=[td_pr_results_state, td_frame_state, td_z_slider] + all_fields,
+            inputs=[td_pr_results_state, td_frame_state, td_t_slider, td_z_slider] + all_fields,
             outputs=[td_preview_plot, td_preview_status],
         )
         td_simulate_btn.click(

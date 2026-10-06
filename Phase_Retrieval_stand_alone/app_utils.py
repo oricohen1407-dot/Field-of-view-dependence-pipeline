@@ -1053,6 +1053,61 @@ def load_phase_retrieval_results(results_dir: str):
     }
 
 
+def sample_experimental_frames(folder: str, n_samples: int, attempts: int = 8, base_delay: float = 0.25) -> dict:
+    """Lists `folder` (sorted .tif/.tiff filenames only -- cheap) and reads just an evenly-spaced
+    SUBSAMPLE of up to n_samples of those files into memory. The real experimental dataset this
+    points at lives on the server hosting the GUI and can be huge (thousands of frames), so this
+    must never read the whole folder -- only the sampled subset ever touches memory.
+
+    Each sampled file may itself be a multi-page TIFF; those pages become that sample's own Z
+    axis (browsed independently per-sample), while the returned T axis indexes across the
+    SAMPLED files themselves -- genuine time, unlike treating one file's own Z-slices as if they
+    were time. Retries on PermissionError, same rationale as gui.py's _read_tiff_with_retry: a
+    file still being written by a live acquisition can be transiently locked."""
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"'{folder}' is not a folder accessible from this server.")
+    names = sorted(f for f in os.listdir(folder) if f.lower().endswith(('.tif', '.tiff')))
+    if not names:
+        raise ValueError(f"No .tif/.tiff files found in '{folder}'.")
+    n_samples = max(1, min(int(n_samples), len(names)))
+    idxs = sorted(set(np.linspace(0, len(names) - 1, n_samples).round().astype(int).tolist()))
+    sampled_names = [names[i] for i in idxs]
+
+    arrays = []
+    ref_hw = None
+    for name in sampled_names:
+        path = os.path.join(folder, name)
+        arr, last_exc = None, None
+        for attempt in range(attempts):
+            try:
+                arr = tifffile.imread(path)
+                break
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(base_delay * (attempt + 1))
+        if arr is None:
+            raise last_exc
+        if arr.ndim == 2:
+            arr = arr[None, ...]
+        elif arr.ndim != 3:
+            raise ValueError(f"'{name}': expected a 2D or 3D (Z,H,W) TIFF, got shape {arr.shape}.")
+        if ref_hw is None:
+            ref_hw = arr.shape[1:]
+        elif arr.shape[1:] != ref_hw:
+            raise ValueError(
+                f"'{name}' is {arr.shape[1:]}, but the first sampled frame '{sampled_names[0]}' "
+                f"is {ref_hw} -- all sampled frames must be the same size."
+            )
+        arrays.append(arr.astype(np.float32))
+
+    vmin = min(float(a.min()) for a in arrays)
+    vmax = max(float(a.max()) for a in arrays)
+    return {
+        "arrays": arrays, "names": sampled_names, "vmin": vmin, "vmax": vmax,
+        "T": len(arrays), "total_files_in_folder": len(names),
+    }
+
+
 def noise_patch_stats(frame: np.ndarray, bbox):
     """Mean/std of pixel values inside a user-marked no-emitter rectangle, bbox=(r0, r1, c0, c1)."""
     r0, r1, c0, c1 = bbox
