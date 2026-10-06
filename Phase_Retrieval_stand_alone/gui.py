@@ -1825,6 +1825,19 @@ def build_demo() -> gr.Blocks:
         def on_td_load_pr():
             return _load_pr_results_and_status()
 
+        def on_td_exp_dir_change(folder):
+            """Fires as soon as the user enters/edits the experimental-data path, before they
+            click "Sample Frames" -- a cheap existence/content check (no frame reads) that
+            either flags a bad path for them to re-select, or shows a small confirmation that
+            the path is good, in the same status box the sampling step itself reports into."""
+            if not folder or not str(folder).strip():
+                return gr.skip()
+            try:
+                names = app_utils.list_experimental_data_files(str(folder).strip())
+            except Exception as exc:
+                return f"[ERROR] {exc} Please re-select a different folder."
+            return f"✓ Found {len(names)} .tif/.tiff file(s) in this folder."
+
         def on_td_sample_frames(folder, n_samples):
             no_slider = gr.update(minimum=0, maximum=1, value=0)
             if not folder or not str(folder).strip():
@@ -2262,6 +2275,9 @@ def build_demo() -> gr.Blocks:
             outputs=[results_dropdown, results_image, results_plot, results_status],
         )
         td_load_pr_btn.click(fn=on_td_load_pr, outputs=[td_pr_results_state, td_pr_status])
+        td_exp_data_dir.change(
+            fn=on_td_exp_dir_change, inputs=[td_exp_data_dir], outputs=[td_sample_status],
+        )
         td_sample_btn.click(
             fn=on_td_sample_frames, inputs=[td_exp_data_dir, td_subsample_n],
             outputs=[td_frame_state, td_noise_bbox_state, td_emitter_bbox_state,

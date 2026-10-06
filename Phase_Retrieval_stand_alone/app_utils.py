@@ -1053,6 +1053,20 @@ def load_phase_retrieval_results(results_dir: str):
     }
 
 
+def list_experimental_data_files(folder: str) -> list:
+    """Cheap existence/content check for an experimental-data folder: lists (sorted)
+    .tif/.tiff FILENAMES only, without reading any of them. Raises FileNotFoundError if
+    `folder` isn't a folder accessible from this server, or ValueError if it has no .tif/.tiff
+    files -- both callable right after the user enters a path, before committing to actually
+    sampling/reading anything."""
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"'{folder}' is not a folder accessible from this server.")
+    names = sorted(f for f in os.listdir(folder) if f.lower().endswith(('.tif', '.tiff')))
+    if not names:
+        raise ValueError(f"No .tif/.tiff files found in '{folder}'.")
+    return names
+
+
 def sample_experimental_frames(folder: str, n_samples: int, attempts: int = 8, base_delay: float = 0.25) -> dict:
     """Lists `folder` (sorted .tif/.tiff filenames only -- cheap) and reads just an evenly-spaced
     SUBSAMPLE of up to n_samples of those files into memory. The real experimental dataset this
@@ -1064,11 +1078,7 @@ def sample_experimental_frames(folder: str, n_samples: int, attempts: int = 8, b
     SAMPLED files themselves -- genuine time, unlike treating one file's own Z-slices as if they
     were time. Retries on PermissionError, same rationale as gui.py's _read_tiff_with_retry: a
     file still being written by a live acquisition can be transiently locked."""
-    if not os.path.isdir(folder):
-        raise FileNotFoundError(f"'{folder}' is not a folder accessible from this server.")
-    names = sorted(f for f in os.listdir(folder) if f.lower().endswith(('.tif', '.tiff')))
-    if not names:
-        raise ValueError(f"No .tif/.tiff files found in '{folder}'.")
+    names = list_experimental_data_files(folder)
     n_samples = max(1, min(int(n_samples), len(names)))
     idxs = sorted(set(np.linspace(0, len(names) - 1, n_samples).round().astype(int).tolist()))
     sampled_names = [names[i] for i in idxs]
