@@ -1965,7 +1965,7 @@ def build_demo() -> gr.Blocks:
             sim_axes = []
             for i, sim in enumerate(sims):
                 ax = fig.add_subplot(gs[0, 2 + i])
-                ax.imshow(sim, cmap="gray")
+                ax.imshow(sim, cmap="gray", vmin=vmin, vmax=vmax)
                 ax.set_title(f"Simulated #{i + 1}")
                 ax.axis("off")
                 sim_axes.append(ax)
