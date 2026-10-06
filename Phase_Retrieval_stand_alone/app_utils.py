@@ -1191,7 +1191,7 @@ def estimate_signal_range(param_dict: dict, baseline_mu: float, exp_maxv: float,
     return round(0.5 * p), round(1.1 * p)
 
 
-def _simulate_one_frame(model, sampling, param_dict):
+def _simulate_one_frame(model, sampling, param_dict, tile_center=None):
     """One simulated training frame: random emitters -> pasted clean PSF patches -> Poisson
     shot noise + dark offset -> bit-depth clip. Ported from the root pipeline's
     training_data_func, but sized from each patch's own returned shape rather than model.N (the
@@ -1208,10 +1208,15 @@ def _simulate_one_frame(model, sampling, param_dict):
     # a tile that's always centered on-axis only ever explores the small range of that shift
     # reachable within one canvas, never the larger shifts a tile far from the true optical axis
     # would see. One draw per frame (not per emitter): a single camera frame corresponds to one
-    # fixed position in the real sensor.
-    max_offset_px = (param_dict['full_fov_px'] - H) / 2.0
-    tile_row = H / 2.0 + (np.random.uniform(-max_offset_px, max_offset_px) if max_offset_px > 0 else 0.0)
-    tile_col = W / 2.0 + (np.random.uniform(-max_offset_px, max_offset_px) if max_offset_px > 0 else 0.0)
+    # fixed position in the real sensor. tile_center overrides this with an explicit (row, col)
+    # instead of a fresh random draw -- e.g. the preview renders several samples all sharing one
+    # chosen position, to compare against the real data at that same spot.
+    if tile_center is not None:
+        tile_row, tile_col = tile_center
+    else:
+        max_offset_px = (param_dict['full_fov_px'] - H) / 2.0
+        tile_row = H / 2.0 + (np.random.uniform(-max_offset_px, max_offset_px) if max_offset_px > 0 else 0.0)
+        tile_col = W / 2.0 + (np.random.uniform(-max_offset_px, max_offset_px) if max_offset_px > 0 else 0.0)
     model.centralBeadCoordinates_pixel = [tile_row, tile_col]
 
     nfp_training_um = param_dict['nfp_training_um']
@@ -1249,12 +1254,16 @@ def _simulate_one_frame(model, sampling, param_dict):
     return im, xyz_ids, blob3d
 
 
-def generate_training_frame(param_dict: dict) -> np.ndarray:
-    """Renders a single sample simulated training frame, for the GUI's live preview."""
+def generate_training_frames(param_dict: dict, n: int, tile_center=None) -> list:
+    """Renders n sample simulated training frames for the GUI's preview, reusing one
+    model/sampling build (cheap -- model's optics grids don't depend on tile_center). With
+    tile_center given, every sample shares that one (row, col) instead of each drawing its own
+    random position, so several independent emitter/noise draws can be compared side by side
+    at the same field position."""
     model = ImModelTraining(param_dict)
     sampling = Sampling(param_dict)
-    im, _, _ = _simulate_one_frame(model, sampling, param_dict)
-    return im
+    return [_simulate_one_frame(model, sampling, param_dict, tile_center=tile_center)[0]
+            for _ in range(n)]
 
 
 def generate_training_data(param_dict: dict, out_dir: str, n_ims: int, stop_event=None) -> None:

@@ -19,6 +19,8 @@ import tifffile
 import torch
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
 
 from config.config import Config, UserConfig, AdvancedConfig, TrainingDataConfig, TrainingRunConfig
 from config.emitter_centers import (
@@ -1938,33 +1940,80 @@ def build_demo() -> gr.Blocks:
             return (noise_bbox, emitter_bbox, rgb, status,
                     bg_min, bg_max, off_min, off_max, sig_min, sig_max)
 
+        def _build_td_preview_figure(full_arr, vmin, vmax, r0, c0, size, sims):
+            """Sampled frame (with a size x size box at the chosen tile position) + a zoom of
+            that box, a vertical separator, then each simulated sample -- all sharing the same
+            tile position, so the real data at that spot and several independent simulated
+            draws there can be compared side by side."""
+            n_sims = len(sims)
+            n_panels = 2 + n_sims
+            fig = Figure(figsize=(3.2 * n_panels, 5.5), constrained_layout=True)
+            FigureCanvasAgg(fig)
+            gs = fig.add_gridspec(1, n_panels, width_ratios=[2.2, 1.1] + [1.0] * n_sims, wspace=0.15)
+
+            ax_full = fig.add_subplot(gs[0, 0])
+            ax_full.imshow(full_arr, cmap="gray", vmin=vmin, vmax=vmax)
+            ax_full.add_patch(Rectangle((c0, r0), size, size, fill=False, edgecolor="red", linewidth=1.5))
+            ax_full.set_title("Sampled frame")
+            ax_full.axis("off")
+
+            ax_zoom = fig.add_subplot(gs[0, 1])
+            ax_zoom.imshow(full_arr[r0:r0 + size, c0:c0 + size], cmap="gray", vmin=vmin, vmax=vmax)
+            ax_zoom.set_title("Zoom")
+            ax_zoom.axis("off")
+
+            sim_axes = []
+            for i, sim in enumerate(sims):
+                ax = fig.add_subplot(gs[0, 2 + i])
+                ax.imshow(sim, cmap="gray")
+                ax.set_title(f"Simulated #{i + 1}")
+                ax.axis("off")
+                sim_axes.append(ax)
+
+            fig.canvas.draw()  # resolve final (constrained-layout) axes positions before measuring the separator line
+            sep_x = (ax_zoom.get_position().x1 + sim_axes[0].get_position().x0) / 2.0
+            y0 = min(ax_full.get_position().y0, ax_zoom.get_position().y0)
+            y1 = max(ax_full.get_position().y1, ax_zoom.get_position().y1)
+            fig.add_artist(Line2D([sep_x, sep_x], [y0, y1], transform=fig.transFigure,
+                                   color="black", linewidth=1.2))
+            return fig
+
         def on_td_update_preview(pr_results, frame_state, t, *vals):
             if pr_results is None:
                 return None, "Load Phase Retrieval Results first."
+            if not frame_state:
+                return None, "Sample experimental frames first (section 2)."
             try:
                 cfg = fields_to_config(*vals)
                 param_dict = cfg.generate_training_param_dict(pr_results)
-                sim = app_utils.generate_training_frame(param_dict)
             except Exception as exc:
                 return None, f"[ERROR] {exc}"
 
-            n_panels = 2 if frame_state else 1
-            fig = Figure(figsize=(5 * n_panels, 5), constrained_layout=True)
-            FigureCanvasAgg(fig)
-            axes = fig.subplots(1, n_panels)
-            axes = [axes] if n_panels == 1 else list(axes)
-            idx = 0
-            if frame_state:
-                tc = max(0, min(int(t), frame_state["T"] - 1))
-                arr = frame_state["arrays"][tc]
-                axes[idx].imshow(arr, cmap="gray", vmin=frame_state["vmin"], vmax=frame_state["vmax"])
-                axes[idx].set_title(f"experimental frame (t={tc})")
-                axes[idx].axis("off")
-                idx += 1
-            axes[idx].imshow(sim, cmap="gray")
-            axes[idx].set_title("simulated frame")
-            axes[idx].axis("off")
-            return fig, "Preview updated."
+            size = param_dict['H']
+            tc = max(0, min(int(t), frame_state["T"] - 1))
+            full_arr = frame_state["arrays"][tc]
+            H_full, W_full = full_arr.shape
+            if H_full < size or W_full < size:
+                return None, (f"[ERROR] Sampled frame ({H_full}x{W_full}px) is smaller than "
+                              f"the training canvas ({size}px).")
+
+            # One random tile position, shared by the overlay box, the zoom, and every
+            # simulated sample below.
+            max_row_off = (H_full - size) / 2.0
+            max_col_off = (W_full - size) / 2.0
+            tile_row = H_full / 2.0 + (np.random.uniform(-max_row_off, max_row_off) if max_row_off > 0 else 0.0)
+            tile_col = W_full / 2.0 + (np.random.uniform(-max_col_off, max_col_off) if max_col_off > 0 else 0.0)
+            r0 = max(0, min(int(round(tile_row - size / 2)), H_full - size))
+            c0 = max(0, min(int(round(tile_col - size / 2)), W_full - size))
+
+            try:
+                sims = app_utils.generate_training_frames(param_dict, 4, tile_center=(tile_row, tile_col))
+            except Exception as exc:
+                return None, f"[ERROR] {exc}"
+
+            fig = _build_td_preview_figure(full_arr, frame_state["vmin"], frame_state["vmax"],
+                                            r0, c0, size, sims)
+            return fig, f"Preview updated -- tile center (row={tile_row:.0f}, col={tile_col:.0f})."
 
         def on_td_simulate(pr_results, out_dir, n_ims, *vals):
             # also blocks against a concurrent Run-tab phase retrieval — see the matching guard
