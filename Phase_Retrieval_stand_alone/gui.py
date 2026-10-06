@@ -1854,9 +1854,7 @@ def build_demo() -> gr.Blocks:
             # normal/expected edge case here, which would otherwise crash with maximum=0=minimum.
             t_update = gr.update(minimum=0, maximum=max(sample["T"] - 1, 1), value=mid_t, step=1,
                                   interactive=sample["T"] > 1)
-            status = (f"Sampled {sample['T']} of {sample['total_pages_in_file']} page(s) from "
-                      f"'{path}'. Mark a no-emitter region and a bright-emitter region, then use "
-                      f"T to browse the other sampled frames.")
+            status = f"Sampled {sample['T']} of {sample['total_pages_in_file']} page(s) from '{path}'."
             return frame_state, None, None, rgb, status, t_update
 
         def _render_td_marks(frame_state, t, noise_bbox, emitter_bbox):
