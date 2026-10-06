@@ -168,7 +168,8 @@ SETUP_CROP_CURSOR_JS = """
             const hCss = hPx * scaleY;
             const color = typeof colorOrFn === 'function' ? colorOrFn() : colorOrFn;
             overlay.style.borderColor = color;
-            overlay.style.background = color + '26';
+            overlay.style.background = 'transparent';  // hollow interior, border only -- matches
+            // the confirmed/pending marks _draw_box draws directly on the image elsewhere
             overlay.style.width = wCss + 'px';
             overlay.style.height = hCss + 'px';
             overlay.style.left = (e.clientX - wCss / 2) + 'px';
