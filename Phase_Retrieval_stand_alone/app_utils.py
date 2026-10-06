@@ -1060,6 +1060,28 @@ def noise_patch_stats(frame: np.ndarray, bbox):
     return float(patch.mean()), float(patch.std())
 
 
+def temporal_noise_baseline(stack: np.ndarray, bbox):
+    """Mean/std of the single darkest-mean pixel within bbox, across every frame of `stack`
+    (Z,H,W) -- mirrors the AutoDS3D/root pipeline's mu_std_p(): isolates genuine per-pixel
+    temporal (read) noise from one fixed pixel's value over time, rather than conflating it
+    with spatial pixel-to-pixel non-uniformity (gain/vignetting) across a patch, as a single-
+    frame spatial mean/std would. Assumes that pixel is background in every frame."""
+    r0, r1, c0, c1 = bbox
+    region = stack[:, r0:r1, c0:c1].astype(np.float64)
+    mean_map = region.mean(axis=0)
+    r_idx, c_idx = np.unravel_index(np.argmin(mean_map), mean_map.shape)
+    bg_trace = region[:, r_idx, c_idx]
+    return float(bg_trace.mean()), float(bg_trace.std())
+
+
+def temporal_peak(stack: np.ndarray, bbox) -> float:
+    """Max pixel value within bbox across every frame of `stack` (Z,H,W) -- catches a blinking
+    emitter at its brightest automatically, instead of requiring the single best Z-slice to
+    already be the one marked."""
+    r0, r1, c0, c1 = bbox
+    return float(stack[:, r0:r1, c0:c1].max())
+
+
 def estimate_signal_range(param_dict: dict, baseline_mu: float, exp_maxv: float, photon_count: float = 1e4):
     """Back-solves an (Nsig_range) photon-count range from a real experimental emitter's peak
     brightness: render a reference on-axis emitter at a known photon_count (mid-z), and compare

@@ -1102,6 +1102,15 @@ def build_demo() -> gr.Blocks:
                             label="Marked-patch height (px)", value=40, precision=0, elem_id="td_noise_h",
                         )
                 td_z_slider = gr.Slider(label="Z-slice (browse)", minimum=0, maximum=1, step=1, value=0)
+                td_estimate_mode = gr.Radio(
+                    ["Current Z-slice", "Across all loaded frames (temporal)"],
+                    value="Current Z-slice", label="Estimate noise/peak from",
+                    info="Temporal: baseline mean/std come from the single darkest-mean pixel's "
+                         "own value over every loaded frame (isolates real per-pixel noise from "
+                         "spatial non-uniformity); peak is the max over the whole stack in the "
+                         "marked emitter box (catches a blinking emitter automatically). Mirrors "
+                         "the method already used in the AutoDS3D/root pipeline's SNR step.",
+                )
                 td_frame_state = gr.State(None)
                 td_noise_bbox_state = gr.State(None)
                 td_emitter_bbox_state = gr.State(None)
@@ -1803,7 +1812,7 @@ def build_demo() -> gr.Blocks:
                 return gr.skip()
             return _render_td_marks(frame_state, z, noise_bbox, emitter_bbox)
 
-        def on_td_frame_click(evt: gr.SelectData, frame_state, w, h, mode, z,
+        def on_td_frame_click(evt: gr.SelectData, frame_state, w, h, mode, estimate_mode, z,
                                noise_bbox, emitter_bbox, pr_results, *vals):
             no_seed = (gr.skip(),) * 6
             if not frame_state:
@@ -1834,15 +1843,25 @@ def build_demo() -> gr.Blocks:
             # Background -- not the other way around, which was the original bug: it injected
             # the raw baseline as if it were noise variance (way too much noise) while leaving
             # the simulated background sitting at ~0 instead of the real baseline.
-            mean, std = app_utils.noise_patch_stats(arr, noise_bbox)
+            is_temporal = estimate_mode is not None and estimate_mode.startswith("Across all")
+            if is_temporal:
+                # AutoDS3D/root's mu_std_p method: baseline from the single darkest-mean pixel's
+                # own value over every loaded frame; peak from the max over every frame in the
+                # marked emitter box (catches a blinking emitter without needing the exact best
+                # Z-slice to already be the one marked).
+                mean, std = app_utils.temporal_noise_baseline(frame_state["array"], noise_bbox)
+                exp_maxv = app_utils.temporal_peak(frame_state["array"], emitter_bbox)
+            else:
+                mean, std = app_utils.noise_patch_stats(arr, noise_bbox)
+                er0, er1, ec0, ec1 = emitter_bbox
+                exp_maxv = float(arr[er0:er1, ec0:ec1].max())
             variance = std ** 2
             bg_min, bg_max = max(0.0, 0.7 * variance), 1.3 * variance
             off_min = off_max = mean
-            er0, er1, ec0, ec1 = emitter_bbox
-            exp_maxv = float(arr[er0:er1, ec0:ec1].max())
 
             if pr_results is None:
-                status = (f"Baseline mean={mean:.1f}, std={std:.1f}; emitter peak={exp_maxv:.1f}. "
+                status = (f"Baseline mean={mean:.1f}, std={std:.1f}; emitter peak={exp_maxv:.1f}"
+                          f"{' (temporal)' if is_temporal else ''}. "
                           f"Seeded Background≈{variance:.1f}, Noise offset≈{mean:.1f}. "
                           f"Load Phase Retrieval Results to also calibrate Signal.")
                 return (noise_bbox, emitter_bbox, rgb, status,
@@ -1852,12 +1871,14 @@ def build_demo() -> gr.Blocks:
                 cfg = fields_to_config(*vals)
                 param_dict = cfg.generate_training_param_dict(pr_results)
                 sig_min, sig_max = app_utils.estimate_signal_range(param_dict, mean, exp_maxv)
-                status = (f"Baseline mean={mean:.1f}, std={std:.1f}; emitter peak={exp_maxv:.1f}. "
+                status = (f"Baseline mean={mean:.1f}, std={std:.1f}; emitter peak={exp_maxv:.1f}"
+                          f"{' (temporal)' if is_temporal else ''}. "
                           f"Seeded Background≈{variance:.1f}, Noise offset≈{mean:.1f}, "
                           f"Signal≈({sig_min:.0f},{sig_max:.0f}) photons.")
             except Exception as exc:
                 sig_min = sig_max = gr.skip()
-                status = (f"Baseline mean={mean:.1f}, std={std:.1f}; emitter peak={exp_maxv:.1f}. "
+                status = (f"Baseline mean={mean:.1f}, std={std:.1f}; emitter peak={exp_maxv:.1f}"
+                          f"{' (temporal)' if is_temporal else ''}. "
                           f"Seeded Background/Noise offset, but Signal calibration failed: {exc}")
 
             return (noise_bbox, emitter_bbox, rgb, status,
@@ -2160,7 +2181,7 @@ def build_demo() -> gr.Blocks:
         )
         td_frame_image.select(
             fn=on_td_frame_click,
-            inputs=[td_frame_state, td_noise_w, td_noise_h, td_mark_mode, td_z_slider,
+            inputs=[td_frame_state, td_noise_w, td_noise_h, td_mark_mode, td_estimate_mode, td_z_slider,
                     td_noise_bbox_state, td_emitter_bbox_state, td_pr_results_state] + all_fields,
             outputs=[td_noise_bbox_state, td_emitter_bbox_state, td_frame_image, td_noise_status,
                      td_bg_min, td_bg_max, td_noise_off_min, td_noise_off_max, td_sig_min, td_sig_max],
