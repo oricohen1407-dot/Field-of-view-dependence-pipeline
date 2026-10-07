@@ -637,7 +637,7 @@ def _opt_str(v):
 
 
 def config_to_fields(cfg: Config) -> list:
-    """Flatten a Config into the ordered list of Gradio field values (82 items)."""
+    """Flatten a Config into the ordered list of Gradio field values (81 items)."""
     u, a, t, tr = cfg.user, cfg.advanced, cfg.training, cfg.training_run
     sig_lo, sig_hi = (float(x) for x in t.signal_range.split(','))
     bg_lo, bg_hi = (float(x) for x in t.background_range.split(','))
@@ -646,7 +646,6 @@ def config_to_fields(cfg: Config) -> list:
     z_lo, z_hi = (float(x) for x in z_source.split(','))
     noff_lo, noff_hi = (float(x) for x in t.noise_offset_range.split(','))
     nfp_training = float(t.nfp_training_um) if t.nfp_training_um.strip() else (z_lo + z_hi) / 2.0
-    full_fov = int(t.full_fov_px) if t.full_fov_px.strip() else t.canvas_size_px
     return [
         # ── Microscope preset fields, part 1 (7 of 8 — bitdepth is with AdvancedConfig below) ──
         u.M, u.NA, u.n_immersion, u.lamda, u.n_sample,
@@ -702,8 +701,6 @@ def config_to_fields(cfg: Config) -> list:
         t.experimental_data_file, t.snr_subsample_frames,
         # ── Generate Training Data — training NFP (z of best focus) — appended, keeps every index above stable ──
         nfp_training,
-        # ── Generate Training Data — full sensor FOV (field-position randomization) — appended, keeps every index above stable ──
-        full_fov,
     ]
 
 
@@ -748,8 +745,6 @@ def fields_to_config(
     td_exp_data_file, td_snr_subsample_frames,
     # Generate Training Data — training NFP (1)
     td_nfp_training,
-    # Generate Training Data — full sensor FOV (1)
-    td_full_fov,
 ) -> Config:
     """Parse ordered Gradio field values back into a Config object."""
     offaxis_files = [
@@ -818,7 +813,6 @@ def fields_to_config(
             experimental_data_file=str(td_exp_data_file).strip(),
             snr_subsample_frames=int(float(td_snr_subsample_frames)),
             nfp_training_um=str(float(td_nfp_training)),
-            full_fov_px=str(int(float(td_full_fov))),
         ),
         training_run=TrainingRunConfig(
             training_data_dir=str(train_data_dir).strip(),
@@ -1168,12 +1162,6 @@ def build_demo() -> gr.Blocks:
                          "below it render as below focus, instead of all defocusing the same way.",
                 )
                 td_canvas_size = gr.Number(label="Training-frame canvas size (px)", value=defaults[55], precision=0)
-                td_full_fov = gr.Number(
-                    label="Full sensor FOV (px)", value=defaults[81], precision=0,
-                    info="Defaults to the canvas size (no effect). Set to the real sensor's "
-                         "full frame size to randomize each generated tile's position within "
-                         "it, so training sees lateral-position-dependent aberration too.",
-                )
 
                 with gr.Accordion("Advanced", open=False):
                     with gr.Row(equal_height=True):
@@ -1291,7 +1279,6 @@ def build_demo() -> gr.Blocks:
             train_num_workers, train_numpy_seed, train_torch_seed, train_sample_viz_every, train_viz_threshold,
             td_exp_data_file, td_subsample_n,
             td_nfp_training,
-            td_full_fov,
         ]
 
         # microscope preset fields, in the fixed order used by microscopes.json entries
@@ -1870,6 +1857,11 @@ def build_demo() -> gr.Blocks:
                 _draw_box(rgb, emitter_bbox, _TD_EMITTER_BOX_COLOR)
             return rgb
 
+        def _full_fov_from_frame_state(frame_state):
+            if not frame_state:
+                return None
+            return min(frame_state["arrays"][0].shape)
+
         def on_td_t_slider_change(t, frame_state, noise_bbox, emitter_bbox):
             if not frame_state:
                 return gr.skip()
@@ -1927,7 +1919,7 @@ def build_demo() -> gr.Blocks:
 
             try:
                 cfg = fields_to_config(*vals)
-                param_dict = cfg.generate_training_param_dict(pr_results)
+                param_dict = cfg.generate_training_param_dict(pr_results, _full_fov_from_frame_state(frame_state))
                 sig_min, sig_max = app_utils.estimate_signal_range(param_dict, mean, exp_maxv)
                 status = (f"Baseline mean={mean:.1f}, std={std:.1f}; emitter peak={exp_maxv:.1f}. "
                           f"Seeded Background≈{variance:.1f}, Noise offset≈{mean:.1f}, "
@@ -1985,7 +1977,7 @@ def build_demo() -> gr.Blocks:
                 return None, "Sample experimental frames first (section 2)."
             try:
                 cfg = fields_to_config(*vals)
-                param_dict = cfg.generate_training_param_dict(pr_results)
+                param_dict = cfg.generate_training_param_dict(pr_results, _full_fov_from_frame_state(frame_state))
             except Exception as exc:
                 return None, f"[ERROR] {exc}"
 
@@ -2015,7 +2007,7 @@ def build_demo() -> gr.Blocks:
                                             r0, c0, size, sims)
             return fig, f"Preview updated -- tile center (row={tile_row:.0f}, col={tile_col:.0f})."
 
-        def on_td_simulate(pr_results, out_dir, n_ims, *vals):
+        def on_td_simulate(pr_results, out_dir, n_ims, frame_state, *vals):
             # also blocks against a concurrent Run-tab phase retrieval — see the matching guard
             # in run_handler for why (shared sys.stdout redirection).
             with _busy_lock:
@@ -2037,7 +2029,7 @@ def build_demo() -> gr.Blocks:
                 return
             try:
                 cfg = fields_to_config(*vals)
-                param_dict = cfg.generate_training_param_dict(pr_results)
+                param_dict = cfg.generate_training_param_dict(pr_results, _full_fov_from_frame_state(frame_state))
             except Exception as exc:
                 _td_run_state["busy"] = False
                 yield f"[CONFIG ERROR] {exc}", gr.update(interactive=True), gr.update(interactive=False)
@@ -2317,7 +2309,8 @@ def build_demo() -> gr.Blocks:
             outputs=[td_preview_plot, td_preview_status],
         )
         td_simulate_btn.click(
-            fn=on_td_simulate, inputs=[td_pr_results_state, td_out_dir, td_n_ims] + all_fields,
+            fn=on_td_simulate,
+            inputs=[td_pr_results_state, td_out_dir, td_n_ims, td_frame_state] + all_fields,
             outputs=[td_log_out, td_simulate_btn, td_stop_btn],
         )
         td_stop_btn.click(fn=on_td_stop, outputs=td_stop_btn)

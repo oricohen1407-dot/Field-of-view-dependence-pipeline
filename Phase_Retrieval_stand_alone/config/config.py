@@ -111,9 +111,6 @@ class TrainingDataConfig:
     # --- Training NFP (z of best focus) — appended, keeps every index above stable ---
     nfp_training_um: str = ""              # "" => midpoint of zmin/zmax at generation time; shifts only the simulated PSFs' defocus phase (z - NFP), not the z ground-truth labels, so emitters render on both sides of focus
 
-    # --- Full sensor FOV (field-position randomization) — appended, keeps every index above stable ---
-    full_fov_px: str = ""                  # "" => canvas_size_px (no randomization, today's on-axis-only behavior); the real sensor's full frame size each generated tile is randomly positioned within
-
 
 @dataclass
 class TrainingRunConfig:
@@ -181,7 +178,7 @@ class Config:
                                   else len(u.offaxis_coords_pixel) + 1,
         }
 
-    def generate_training_param_dict(self, pr_results: dict) -> dict:
+    def generate_training_param_dict(self, pr_results: dict, full_fov_px: int = None) -> dict:
         """
         Parameters consumed by Sampling and ImModelTraining (DS3Dplus/ds3d_utils.py) to
         generate simulated training frames using the phase-retrieval-fitted PSF.
@@ -204,7 +201,7 @@ class Config:
         zrange_source = t.zrange_um if t.zrange_um.strip() else u.zrange
         zmin, zmax = (float(x) for x in zrange_source.split(','))
         nfp_training_um = float(t.nfp_training_um) if t.nfp_training_um.strip() else (zmin + zmax) / 2.0
-        full_fov_px = int(t.full_fov_px) if t.full_fov_px.strip() else H
+        full_fov_px = int(full_fov_px) if full_fov_px is not None else H
         if full_fov_px < H:
             raise ValueError(f"Full sensor FOV ({full_fov_px}px) must be >= the training-frame canvas size ({H}px).")
         ps_xy = u.ps_camera / u.M
