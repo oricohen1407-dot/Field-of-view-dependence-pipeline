@@ -1,11 +1,6 @@
 # main.py
-# Run AutoDS3D steps without the GUI. Edit the PARAMS below and run any step.
-
-# Steps to install:
-# 1. create a virtual environment and activate it:
-#     (python -m venv .venv; .\.venv\Scripts\activate on Windows, or source .venv/bin/activate on Linux/Mac)
-# 2. pip install -r requirements.txt
-# 3. python main.py
+# GUI entry point (see repo root README.md for setup via setup/setup.sh or setup/setup.bat).
+# Use --no-gui to run AutoDS3D steps headlessly instead; edit the PARAMS below first.
 
 import argparse
 import os
@@ -35,7 +30,7 @@ cfg = Config(
         central_bead_coordinates_pixel=CENTRAL_BEAD_COORDINATES_PIXEL,
         offaxis_zstack_files=OFFAXIS_ZSTACK_FILES,
         offaxis_coords_pixel=OFFAXIS_COORDS_PIXEL,
-        external_mask=None,           # or absolute path to a .npy mask
+        external_mask=None,           # optional starting-guess mask (.npy/.mat) for phase retrieval
     )
 )
 # =============================================================================
@@ -49,11 +44,17 @@ def run_characterize_PSF():
 def main():
     parser = argparse.ArgumentParser(description="DeepSTORM3D PSF characterization")
     parser.add_argument("--no-gui", action="store_true", help="Run headlessly without opening the browser GUI")
+    parser.add_argument("--host", default="127.0.0.1",
+                         help="Interface to bind the GUI to. Use 0.0.0.0 to accept connections "
+                              "from other machines (LAN or public IP, depending on your network/"
+                              "firewall/router setup). Default: 127.0.0.1 (local only).")
+    parser.add_argument("--port", type=int, default=None,
+                         help="Port to serve the GUI on (default: Gradio's own default, 7860).")
     args = parser.parse_args()
     if args.no_gui:
         run_characterize_PSF()
     else:
-        build_demo().launch()
+        build_demo().launch(server_name=args.host, server_port=args.port)
 
 
 if __name__ == "__main__":

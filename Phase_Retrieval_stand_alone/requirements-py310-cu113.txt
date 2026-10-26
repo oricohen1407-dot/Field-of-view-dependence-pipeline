@@ -1,0 +1,40 @@
+# Alternate pin set for a machine limited to Python 3.10 and CUDA 11.3
+# (e.g. an old NVIDIA driver like 465.19.01 that caps CUDA at 11.3, with no admin
+# rights to update it). Not needed on a normal, up-to-date setup -- use the main
+# requirements.txt there instead.
+#
+# torch==2.12.0 (the main requirements.txt pin) has no CUDA-11.3 build -- PyTorch's
+# oldest CUDA build for x86_64 today only goes back to cu121, and even that index
+# stops publishing far short of 2.12.0. torch 1.12.1+cu113 is the newest version
+# PyTorch still publishes a CUDA-11.3 x86_64 wheel for. All other versions below were
+# picked so the whole set resolves together for Python 3.10 with numpy<2 (torch
+# versions this old predate NumPy 2.0's ABI break and can crash or fail to import
+# against numpy>=2.0).
+#
+# torchvision/torchaudio are intentionally omitted -- grep confirms neither is
+# imported anywhere in this project, only listed as unused boilerplate in the main
+# requirements.txt.
+--extra-index-url https://download.pytorch.org/whl/cu113
+
+# Core Machine Learning & Data Science
+torch==1.12.1+cu113
+numpy==1.26.4
+scipy==1.15.3
+pandas==2.3.2
+scikit-learn==1.7.2
+scikit-image==0.25.2
+
+# Visualization & UI
+matplotlib==3.10.9
+gradio==6.15.2
+gradio-client==2.5.0
+
+# Image/File Handling
+pillow==12.2.0
+tifffile==2025.5.10
+h5py==3.14.0
+huggingface_hub==1.17.0
+
+# Utilities
+tqdm==4.70.1
+pyyaml==6.0.3
