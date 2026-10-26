@@ -1,11 +1,6 @@
 # main.py
-# Run AutoDS3D steps without the GUI. Edit the PARAMS below and run any step.
-
-# Steps to install:
-# 1. create a virtual environment and activate it:
-#     (python -m venv .venv; .\.venv\Scripts\activate on Windows, or source .venv/bin/activate on Linux/Mac)
-# 2. pip install -r requirements.txt
-# 3. python main.py
+# GUI entry point (see repo root README.md for setup via setup/setup.sh or setup/setup.bat).
+# Use --no-gui to run AutoDS3D steps headlessly instead; edit the PARAMS below first.
 
 import argparse
 import os
