@@ -2149,8 +2149,12 @@ def build_demo() -> gr.Blocks:
             except Exception as exc:
                 return None, f"[ERROR] {exc}"
 
-            fig = _build_td_preview_figure(full_arr, frame_state["vmin"], frame_state["vmax"],
-                                            r0, c0, size, sims)
+            # Simulated frames are baseline-subtracted (see _add_camera_noise); debias the real
+            # frame the same way so both panel groups share a meaningful contrast scale.
+            baseline = app_utils.calibrated_baseline_estimate(param_dict)
+            full_arr_disp = app_utils.subtract_calibrated_background(full_arr, param_dict)
+            fig = _build_td_preview_figure(full_arr_disp, frame_state["vmin"] - baseline,
+                                            frame_state["vmax"] - baseline, r0, c0, size, sims)
             return fig, f"Preview updated -- tile center (row={tile_row:.0f}, col={tile_col:.0f})."
 
         def on_td_simulate(pr_results, out_dir, n_ims, frame_state, *vals):
@@ -2596,8 +2600,10 @@ def build_demo() -> gr.Blocks:
 
         # Inference's experimental-data-file field auto-populates from Generate Training
         # Data's own field, so the path doesn't need retyping between tabs -- still a plain
-        # editable Textbox the user can override by hand at any time.
-        td_exp_data_file.change(fn=lambda v: v, inputs=[td_exp_data_file], outputs=[infer_exp_data_file])
+        # editable Textbox the user can override by hand at any time. .input() (user-driven
+        # edits only), not .change(), so loading a saved Config -- which sets td_exp_data_file
+        # programmatically -- doesn't cascade and clobber a separately-loaded inference value.
+        td_exp_data_file.input(fn=lambda v: v, inputs=[td_exp_data_file], outputs=[infer_exp_data_file])
         infer_load_td_btn.click(fn=on_infer_load_td, inputs=[infer_training_data_dir], outputs=[infer_td_meta_state, infer_td_status])
         infer_update_preview_btn.click(
             fn=on_infer_preview, inputs=[infer_td_meta_state, infer_preview_frame_index] + all_fields,
