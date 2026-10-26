@@ -1805,7 +1805,7 @@ class Volume2XYZ(nn.Module):
         zloc = torch.squeeze(sums[:, 3] / sums[:, 0])
         return xloc, yloc, zloc, conf_rec
 
-    def forward(self, pred_vol):
+    def forward(self, pred_vol, return_voxel_coords=False):
         # added on  19/04/2026 to prevent z section preference
         '''
         kz = torch.tensor([1.0, 2.0, 3.0, 2.0, 1.0], device=pred_vol.device, dtype=pred_vol.dtype)  # make it more parameter based?
@@ -1850,6 +1850,8 @@ class Volume2XYZ(nn.Module):
             #if len(ybool) == 0:  # added on 22/04/2026 for weightening instead of maxpooling
             xyz_rec = None
             conf_rec = None
+            voxel_ids = None
+            voxel_locals = None
         else:
             '''# added on 22/04/2026 for weightening instead of maxpooling:
             pred_vol_pad = self.pad(pred_vol) 
@@ -1935,7 +1937,21 @@ class Volume2XYZ(nn.Module):
 
             conf_rec = conf_vol[zbool, ybool, xbool]  # use the peak
             conf_rec = conf_rec.cpu().numpy()  # conf_rec is the sum of each 3D blob
-            
+
+            if return_voxel_coords:
+                # zloc/yloc/xloc can collapse to 0-d scalars via torch.squeeze when there's
+                # exactly one detection -- reshape(-1) normalizes them back to length-1 1-D
+                # before stacking, which torch.stack(dim=1) requires.
+                voxel_ids = torch.stack((zbool, ybool, xbool), dim=1).cpu().numpy()
+                voxel_locals = torch.stack(
+                    (zloc.reshape(-1), yloc.reshape(-1), xloc.reshape(-1)), dim=1
+                ).cpu().numpy()
+            else:
+                voxel_ids = None
+                voxel_locals = None
+
+        if return_voxel_coords:
+            return xyz_rec, conf_rec, voxel_ids, voxel_locals
         return xyz_rec, conf_rec
 
 

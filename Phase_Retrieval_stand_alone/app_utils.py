@@ -1053,6 +1053,187 @@ def load_phase_retrieval_results(results_dir: str):
     }
 
 
+def load_inference_checkpoint(checkpoint_path: str, device: str):
+    """Loads a Train Model checkpoint (net_*.pt/last_net_*.pt) for inference. Returns None
+    (not an exception) if checkpoint_path doesn't exist yet. weights_only=False: this
+    checkpoint is the app's own locally-created file (contains a raw LON module instance under
+    'net', not just tensors), and PyTorch 2.6+ defaults torch.load to weights_only=True, which
+    would otherwise refuse to unpickle it."""
+    if not checkpoint_path or not os.path.isfile(checkpoint_path):
+        return None
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    net = checkpoint.get('net')
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict'))
+    if net is None or state_dict is None:
+        raise ValueError(
+            f"{checkpoint_path} doesn't look like a checkpoint this app wrote -- missing "
+            f"'net' and/or both 'model_state_dict'/'state_dict'. Point 'Checkpoint path' at a "
+            f"net_*.pt/last_net_*.pt file from the Train Model tab."
+        )
+    net.load_state_dict(state_dict)
+    net.to(device)
+    net.eval()
+    return net
+
+
+def _tile_starts_1d(length: int, patch: int, stride: int) -> list:
+    """Sliding-window tile start positions along one axis, root's own construction (ported
+    as-is) plus one guard root lacks: raise instead of silently producing an invalid range."""
+    if length < patch:
+        raise ValueError(f"frame length ({length}) is smaller than the tile size ({patch}).")
+    starts = list(range(0, max(1, length - patch + 1), stride))
+    if starts[-1] != length - patch:
+        starts.append(length - patch)
+    return starts
+
+
+def _trusted_bounds_1d(starts: list, patch: int, length: int) -> list:
+    """For each tile, the [lo, hi) window of GLOBAL pixel positions it's trusted to report
+    detections in. Root computes a fixed margin from stride alone, which assumes every tile is
+    exactly `stride` from its neighbor -- broken by the forced final border tile whenever
+    stride doesn't evenly divide (length - patch). Using the midpoint between each pair of
+    neighboring tile centers as both tiles' shared boundary can never gap or overlap, by
+    construction, regardless of how irregularly `starts` is spaced."""
+    centers = [s + (patch - 1) / 2.0 for s in starts]
+    bounds = []
+    for i in range(len(starts)):
+        lo = 0 if i == 0 else int(round((centers[i - 1] + centers[i]) / 2.0))
+        hi = length if i == len(starts) - 1 else int(round((centers[i] + centers[i + 1]) / 2.0))
+        bounds.append((lo, hi))
+    return bounds
+
+
+def render_xyz_to_volume(voxel_ids, voxel_locals, amplitudes, volume_size, blob_r, blob_sigma) -> np.ndarray:
+    """Renders discrete points back into a (D,HH,WW) density volume by additive Gaussian-blob
+    pasting -- adapted from the identical logic in MyDataset.__getitem__/Sampling.show_volume
+    (DS3Dplus/ds3d_utils.py), but taking points as plain arguments instead of reading them off
+    self.labels[id]/self.xyzp_batch()'s own random draw. voxel_ids/voxel_locals columns are
+    (z,y,x), matching volume_size's own axis order -- NOT xyz_ids' (x,y,z) column order
+    elsewhere in this codebase. None/empty input returns an all-zero volume."""
+    volume = np.zeros(volume_size, dtype=np.float32)
+    if voxel_ids is None or len(voxel_ids) == 0:
+        return volume
+    volume = np.pad(volume, blob_r)
+    pn = 2 * blob_r + 1
+    xs = np.linspace(-blob_r, blob_r, pn)
+    zz, yy, xx = np.meshgrid(xs, xs, xs, indexing='ij')
+    Z, Y, X = volume.shape
+    for i in range(len(voxel_ids)):
+        z0, y0, x0 = (int(v) for v in voxel_ids[i])
+        zl, yl, xl = voxel_locals[i]
+        z1, y1, x1 = z0 + pn, y0 + pn, x0 + pn
+        if z0 < 0 or y0 < 0 or x0 < 0 or z1 > Z or y1 > Y or x1 > X:
+            continue
+        blob = np.exp(-0.5 * ((zz - zl) ** 2 + (yy - yl) ** 2 + (xx - xl) ** 2) / blob_sigma ** 2)
+        volume[z0:z1, y0:y1, x0:x1] += blob * amplitudes[i]
+    return volume[blob_r:-blob_r, blob_r:-blob_r, blob_r:-blob_r]
+
+
+def _self_consistency_loss(pred_vol, voxel_ids, voxel_locals, conf_rec, param_dict, device) -> float:
+    """No ground truth exists for real data, so this compares a tile's raw predicted density
+    against a re-render of the discrete points Volume2XYZ decoded from it, via the same
+    KDE_loss3D training uses. Not comparable to a held-out validation loss -- the decode's own
+    thresholding is lossy, so this metric's floor reflects that, not a true mismatch; useful
+    for its trend, and for comparing frames/tiles to each other."""
+    D, HH, WW = pred_vol.shape[-3], pred_vol.shape[-2], pred_vol.shape[-1]
+    recon = render_xyz_to_volume(
+        voxel_ids, voxel_locals, conf_rec, (D, HH, WW),
+        param_dict['blob_r'], param_dict['blob_sigma'],
+    )
+    us_factor = param_dict['us_factor']
+    sigma = 1.0 if us_factor == 1 else 0.5 * (us_factor / 2)
+    loss_fn = KDE_loss3D(sigma, device)
+    pred_bol = pred_vol.reshape(1, D, HH, WW).to(device)
+    target_bol = torch.from_numpy(recon).to(device).reshape(1, D, HH, WW)
+    return float(loss_fn(pred_bol, target_bol).item())
+
+
+def _localize_frame(net, volume2xyz, im_full, param_dict, inference_dict, device, collect_debug=False):
+    """Shared core for the preview, the full run, and the live debug window. Tiles im_full,
+    runs each tile through net -> volume2xyz, converts tile-local um to global um via root's
+    exact offset formula, and gates each tile's detections into its own trusted-bounds window
+    (the tiling-overlap fix) so overlapping tiles never double-report the same molecule.
+    Returns (xyz_um_global, conf) for the whole frame; with collect_debug=True also returns a
+    third value -- a list of every tile's own (pred_vol, voxel_ids, voxel_locals, conf_rec),
+    straight from the same net/volume2xyz call already made (no extra forward passes)."""
+    im_full = subtract_calibrated_background(im_full, param_dict)
+    H_full, W_full = im_full.shape
+    patch_H, patch_W = param_dict['H'], param_dict['W']
+    center_fraction = inference_dict['center_fraction']
+
+    stride_H = max(1, min(int(round(patch_H * center_fraction)), patch_H))
+    stride_W = max(1, min(int(round(patch_W * center_fraction)), patch_W))
+    y_starts = _tile_starts_1d(H_full, patch_H, stride_H)
+    x_starts = _tile_starts_1d(W_full, patch_W, stride_W)
+    y_bounds = _trusted_bounds_1d(y_starts, patch_H, H_full)
+    x_bounds = _trusted_bounds_1d(x_starts, patch_W, W_full)
+
+    vs_xy = param_dict['vs_xy']
+    us = param_dict['us_factor']
+    ch_full, cw_full = (H_full - 1) / 2.0, (W_full - 1) / 2.0
+
+    # Fresh LOCAL [-1,1] X/Y coordinate maps over the tile's own size (deviation #4 in the
+    # Inference plan): identical to what MyDataset.__getitem__ builds with y0=x0=0 (no _FOV_ in
+    # our training filenames, so every training tile used this same position-independent
+    # range) -- same for every tile here regardless of position, so computed once and reused.
+    yy_local, xx_local = np.mgrid[0:patch_H, 0:patch_W]
+    Xmap = (xx_local / (patch_W - 1) * 2 - 1).astype(np.float32)
+    Ymap = (yy_local / (patch_H - 1) * 2 - 1).astype(np.float32)
+    coord = np.stack([Xmap, Ymap], axis=0)
+
+    all_xyz_um, all_conf, debug_tiles = [], [], []
+    eps = 1e-6
+
+    with torch.no_grad():
+        for yi, y0 in enumerate(y_starts):
+            for xi, x0 in enumerate(x_starts):
+                patch = im_full[y0:y0 + patch_H, x0:x0 + patch_W]
+                patch_3 = np.concatenate([patch[np.newaxis, :, :].astype(np.float32), coord], axis=0)
+                inp = torch.from_numpy(patch_3[np.newaxis]).to(device)
+                pred_vol = net(inp)
+
+                decoded = volume2xyz(pred_vol, return_voxel_coords=collect_debug)
+                if collect_debug:
+                    xyz_patch, conf_patch, voxel_ids, voxel_locals = decoded
+                    debug_tiles.append((pred_vol, voxel_ids, voxel_locals, conf_patch))
+                else:
+                    xyz_patch, conf_patch = decoded
+
+                if xyz_patch is None or len(xyz_patch) == 0:
+                    continue
+
+                cy = y0 + (patch_H - 1) / 2.0
+                cx = x0 + (patch_W - 1) / 2.0
+                x_um_global = xyz_patch[:, 0] + (cx - cw_full) * vs_xy * us
+                y_um_global = xyz_patch[:, 1] + (cy - ch_full) * vs_xy * us
+                z_um_global = xyz_patch[:, 2]
+
+                x_pix_global = x_um_global / (vs_xy * us) + cw_full
+                y_pix_global = y_um_global / (vs_xy * us) + ch_full
+                x_lo, x_hi = x_bounds[xi]
+                y_lo, y_hi = y_bounds[yi]
+                mask_valid = (
+                    (x_pix_global >= x_lo - eps) & (x_pix_global < x_hi + eps) &
+                    (y_pix_global >= y_lo - eps) & (y_pix_global < y_hi + eps)
+                )
+                if not np.any(mask_valid):
+                    continue
+
+                all_xyz_um.append(np.c_[x_um_global[mask_valid], y_um_global[mask_valid], z_um_global[mask_valid]])
+                all_conf.append(conf_patch[mask_valid])
+
+    if all_xyz_um:
+        xyz_um_global = np.vstack(all_xyz_um)
+        conf = np.concatenate(all_conf)
+    else:
+        xyz_um_global = np.zeros((0, 3))
+        conf = np.zeros((0,))
+
+    if collect_debug:
+        return xyz_um_global, conf, debug_tiles
+    return xyz_um_global, conf
+
+
 def list_experimental_data_file_info(path: str) -> int:
     """Cheap existence/content check for a single experimental-data TIFF file: opens it via
     tifffile.TiffFile, which reads only the page directory/metadata, not any pixel data, and
@@ -1249,13 +1430,22 @@ def _simulate_one_frame(model, sampling, param_dict, tile_center=None):
     return im, xyz_ids, blob3d
 
 
+def calibrated_baseline_estimate(param_dict: dict) -> float:
+    off_lo, off_hi = param_dict['noise_offset_range']
+    return (off_lo + off_hi) / 2.0
+
+
+def subtract_calibrated_background(frame: np.ndarray, param_dict: dict) -> np.ndarray:
+    return frame.astype(np.float32) - calibrated_baseline_estimate(param_dict)
+
+
 def _add_camera_noise(canvas: np.ndarray, param_dict: dict) -> np.ndarray:
     bg_lo, bg_hi = param_dict['shot_noise_background_range']
     off_lo, off_hi = param_dict['noise_offset_range']
     background = float(np.random.uniform(bg_lo, bg_hi)) ** 2
     offset = float(np.random.uniform(off_lo, off_hi))
     noise = np.random.poisson(np.full_like(canvas, background)) - background
-    im = np.abs(canvas + noise + offset)
+    im = np.abs(canvas + noise + offset - calibrated_baseline_estimate(param_dict))
     return np.clip(im, 0, 2 ** param_dict['bitdepth'] - 1).astype(np.uint16)
 
 
@@ -1787,5 +1977,171 @@ def train_model(param_dict: dict, training_dict: dict, live_box: dict = None, st
     t1 = time.time()
     print(f'training results in {net_file}, {last_net_file} and {fit_file}')
     print(f'finished training in {t1 - t0}s.')
+
+
+# ============================================================
+# Inference
+# ============================================================
+
+def preview_inference_frame(param_dict: dict, inference_dict: dict, frame_index: int = 0):
+    """Loads the checkpoint, picks one page from experimental_data_file, localizes it, and
+    renders a raw-frame-plus-overlay sanity-check figure: imshow the raw frame, scatter
+    detected (x,y) in one fixed color. Returns (fig, status_str)."""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    device = param_dict['device']
+    checkpoint_path = inference_dict['checkpoint_path']
+    net = load_inference_checkpoint(checkpoint_path, device)
+    if net is None:
+        return None, "Enter a valid checkpoint path first."
+
+    exp_file = inference_dict['experimental_data_file']
+    if not exp_file or not os.path.isfile(exp_file):
+        return None, "Enter an experimental data file path first."
+    n_pages = list_experimental_data_file_info(exp_file)
+    frame_index = max(0, min(int(frame_index), n_pages - 1))
+    with tifffile.TiffFile(exp_file) as tif:
+        im_full = tif.pages[frame_index].asarray().astype(np.float32)
+
+    volume2xyz = Volume2XYZ(param_dict)
+    xyz_um, conf = _localize_frame(net, volume2xyz, im_full, param_dict, inference_dict, device)
+
+    fig = Figure(figsize=(6, 6), constrained_layout=True)
+    FigureCanvasAgg(fig)
+    ax = fig.subplots(1, 1)
+    ax.imshow(im_full, cmap="gray")
+    if xyz_um.shape[0] > 0:
+        vs_xy, us = param_dict['vs_xy'], param_dict['us_factor']
+        H_full, W_full = im_full.shape
+        cw_full, ch_full = (W_full - 1) / 2.0, (H_full - 1) / 2.0
+        x_pix = xyz_um[:, 0] / (vs_xy * us) + cw_full
+        y_pix = xyz_um[:, 1] / (vs_xy * us) + ch_full
+        ax.scatter(x_pix, y_pix, s=20, facecolors='none', edgecolors='red', linewidths=1.2)
+    ax.set_title(f"page {frame_index}/{n_pages - 1} -- {xyz_um.shape[0]} detection(s)")
+    ax.axis("off")
+    return fig, f"Preview updated -- {xyz_um.shape[0]} detection(s) on page {frame_index}."
+
+
+def run_inference(param_dict: dict, inference_dict: dict, live_box: dict = None, stop_event=None) -> dict:
+    """Faithful port of root's inference_func2, with the tiling-overlap fix and local per-tile
+    coordinate maps (see _localize_frame). If live_box is given, updates progress every frame
+    and, throttled by live_viz_every_frames (loss and viz share one cadence -- the self-
+    consistency loss is extra work per tile, not worth paying on every frame of a long run),
+    adds one loss point and one overlay frame."""
+    device = param_dict['device']
+    checkpoint_path = inference_dict['checkpoint_path']
+    net = load_inference_checkpoint(checkpoint_path, device)
+    if net is None:
+        raise ValueError(f"No checkpoint found at {checkpoint_path!r}.")
+    volume2xyz = Volume2XYZ(param_dict)
+
+    exp_file = inference_dict['experimental_data_file']
+    n_frames = list_experimental_data_file_info(exp_file)
+
+    output_dir = inference_dict['output_dir']
+    os.makedirs(output_dir, exist_ok=True)
+    time_now = datetime.today().strftime('%m-%d_%H-%M')  # once per run, not recomputed per flush
+
+    header = ['frame', 'x [nm]', 'y [nm]', 'z [nm]', 'intensity [au]']
+    chunk_size_frames = max(1, int(inference_dict['save_chunk_frames']))
+    live_viz_every = max(1, int(inference_dict['live_viz_every_frames']))
+    chunk_id = 0
+    rows_buffer = []
+    csv_files = []
+
+    def _flush():
+        nonlocal chunk_id
+        if not rows_buffer:
+            return
+        chunk_name = os.path.join(output_dir, f'localizations_{time_now}_chunk_{chunk_id:04d}.csv')
+        with open(chunk_name, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows_buffer)
+        csv_files.append(chunk_name)
+        rows_buffer.clear()
+        chunk_id += 1
+
+    t0 = time.time()
+    total_detections = 0
+    frames_processed = 0
+    stopped_early = False
+    loss_history = []
+    recent_frames = []  # rolling buffer of (raw_frame, xyz_um) for the live overlay panels
+
+    with tifffile.TiffFile(exp_file) as tif:
+        for frame_idx in range(n_frames):
+            if stop_event is not None and stop_event.is_set():
+                print(f"[INFER] stopped at frame {frame_idx}/{n_frames}")
+                stopped_early = True
+                break
+
+            im_full = tif.pages[frame_idx].asarray().astype(np.float32)
+            do_debug = live_box is not None and (frame_idx % live_viz_every == 0)
+            result = _localize_frame(net, volume2xyz, im_full, param_dict, inference_dict,
+                                      device, collect_debug=do_debug)
+            if do_debug:
+                xyz_um, conf, debug_tiles = result
+            else:
+                xyz_um, conf = result
+
+            n_det = xyz_um.shape[0]
+            total_detections += n_det
+            if n_det > 0:
+                frm_col = (frame_idx + 1) * np.ones(n_det)
+                nm = xyz_um * 1000.0
+                rows_buffer.extend(np.column_stack((frm_col, nm, conf)).tolist())
+
+            frames_processed += 1
+            if frames_processed % chunk_size_frames == 0:
+                _flush()
+            if frames_processed % 100 == 0:
+                print(f"[INFER] frame [{frames_processed} / {n_frames}], "
+                      f"{total_detections} detection(s) so far")
+
+            if live_box is not None:
+                elapsed = time.time() - t0
+                snapshot = dict(
+                    frame=frames_processed, total_frames=n_frames, elapsed_s=elapsed,
+                    eta_s=elapsed / frames_processed * (n_frames - frames_processed),
+                    total_detections=total_detections,
+                )
+                if do_debug:
+                    tile_losses = [
+                        _self_consistency_loss(pv, vids, vlocs, cr, param_dict, device)
+                        for (pv, vids, vlocs, cr) in debug_tiles
+                    ]
+                    if tile_losses:
+                        loss_history.append(float(np.mean(tile_losses)))
+                    # Pre-convert to pixel coords here (param_dict is in scope) so the figure
+                    # builder on the GUI side only needs to imshow + scatter, not repeat this
+                    # unit conversion with no access to param_dict.
+                    if xyz_um.shape[0] > 0:
+                        vs_xy, us = param_dict['vs_xy'], param_dict['us_factor']
+                        H_f, W_f = im_full.shape
+                        cw_f, ch_f = (W_f - 1) / 2.0, (H_f - 1) / 2.0
+                        x_pix = xyz_um[:, 0] / (vs_xy * us) + cw_f
+                        y_pix = xyz_um[:, 1] / (vs_xy * us) + ch_f
+                    else:
+                        x_pix = np.zeros(0)
+                        y_pix = np.zeros(0)
+                    recent_frames.append((im_full, x_pix, y_pix))
+                    if len(recent_frames) > 4:
+                        recent_frames.pop(0)
+                    snapshot['loss_history'] = list(loss_history)
+                    snapshot['recent_frames'] = list(recent_frames)
+                snapshot['version'] = live_box.get('version', 0) + 1
+                live_box.update(snapshot)
+
+    _flush()
+    elapsed_s = time.time() - t0
+    print(f"[INFER] done. {frames_processed} frame(s), {total_detections} detection(s), "
+          f"{len(csv_files)} CSV chunk(s), {elapsed_s:.1f}s.")
+    return dict(
+        csv_files=csv_files, total_frames=frames_processed,
+        total_detections=total_detections, elapsed_s=elapsed_s,
+        stopped_early=stopped_early,
+    )
 
     return net_file, fit_file

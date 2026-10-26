@@ -22,7 +22,9 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 
-from config.config import Config, UserConfig, AdvancedConfig, TrainingDataConfig, TrainingRunConfig
+from config.config import (
+    Config, UserConfig, AdvancedConfig, TrainingDataConfig, TrainingRunConfig, InferenceRunConfig,
+)
 from config.emitter_centers import (
     PROJECT_DIR as DATA_ROOT_DIR, ZSTACK_FILES_PATH,
     ZSTACK_FILE, CENTRAL_BEAD_COORDINATES_PIXEL, OFFAXIS_ZSTACK_FILES, OFFAXIS_COORDS_PIXEL,
@@ -421,6 +423,63 @@ def _build_train_live_figure(live_box: dict):
     return fig
 
 
+def _build_inference_live_figure(live_box: dict):
+    """Build the Inference tab's live debug window from app_utils.run_inference's latest
+    snapshot: self-consistency loss history + an info panel on the left (real data has no
+    ground truth, so this measures how well each tile's own decoded points reproduce its own
+    raw predicted density -- see app_utils._self_consistency_loss), a separator, then the most
+    recently processed throttled frames on the right, each with its detections overlaid in one
+    color, all sharing one display scale (same reasoning as _build_td_preview_figure's shared
+    vmin/vmax: without it, a frame with many/bright detections would auto-contrast away
+    exactly the texture being sanity-checked). Same object-oriented Figure + FigureCanvasAgg
+    convention as _build_train_live_figure."""
+    loss_hist = live_box.get('loss_history')
+    if loss_hist is None:
+        return None
+    recent_frames = live_box.get('recent_frames', [])
+
+    n_frames = max(1, len(recent_frames))
+    left_ratio, right_ratio = 1.3, 1.0 * n_frames
+    fig = Figure(figsize=(3.2 + 3.0 * n_frames, 5.0), constrained_layout=True)
+    FigureCanvasAgg(fig)
+    subfig_left, subfig_right = fig.subfigures(1, 2, width_ratios=[left_ratio, right_ratio])
+
+    ax_loss, ax_info = subfig_left.subplots(2, 1)
+    x = list(range(1, len(loss_hist) + 1))
+    ax_loss.plot(x, loss_hist, color="tab:orange")
+    ax_loss.set_yscale("log")
+    ax_loss.set_xlabel("throttle tick")
+    ax_loss.set_title(f"self-consistency loss (current={loss_hist[-1]:.3g})", fontsize=9)
+
+    ax_info.axis("off")
+    info_lines = [
+        f"frame {live_box.get('frame', 0)} / {live_box.get('total_frames', 0)}",
+        f"elapsed {_fmt_hms(live_box.get('elapsed_s', 0))}",
+        f"ETA {_fmt_hms(live_box.get('eta_s', 0))}",
+        f"detections: {live_box.get('total_detections', 0)}",
+    ]
+    ax_info.text(0.0, 0.5, "\n".join(info_lines), fontsize=10, va="center", family="monospace")
+
+    if recent_frames:
+        all_vals = np.concatenate([f.ravel() for f, _, _ in recent_frames])
+        vmin, vmax = float(all_vals.min()), float(all_vals.max())
+        frame_axes = subfig_right.subplots(1, len(recent_frames))
+        if len(recent_frames) == 1:
+            frame_axes = [frame_axes]
+        for i, (ax, (raw_frame, x_pix, y_pix)) in enumerate(zip(frame_axes, recent_frames)):
+            ax.imshow(raw_frame, cmap="gray", vmin=vmin, vmax=vmax)
+            if len(x_pix) > 0:
+                ax.scatter(x_pix, y_pix, s=16, facecolors='none', edgecolors='red', linewidths=1.0)
+            ax.set_title(f"frame #{i + 1}", fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+
+        sep_x = left_ratio / (left_ratio + right_ratio)
+        fig.add_artist(Line2D([sep_x, sep_x], [0.05, 0.95], transform=fig.transFigure,
+                               color="black", linewidth=1.2))
+
+    return fig
+
+
 # ── Calibration Setup helpers (click-to-crop emitter picker) ──────────────────
 
 _COORD_RE = re.compile(r"_x(\d+)_y(\d+)")
@@ -637,8 +696,8 @@ def _opt_str(v):
 
 
 def config_to_fields(cfg: Config) -> list:
-    """Flatten a Config into the ordered list of Gradio field values (81 items)."""
-    u, a, t, tr = cfg.user, cfg.advanced, cfg.training, cfg.training_run
+    """Flatten a Config into the ordered list of Gradio field values (91 items)."""
+    u, a, t, tr, ir = cfg.user, cfg.advanced, cfg.training, cfg.training_run, cfg.inference_run
     sig_lo, sig_hi = (float(x) for x in t.signal_range.split(','))
     bg_lo, bg_hi = (float(x) for x in t.background_range.split(','))
     dens_lo, dens_hi = (float(x) for x in t.density_range.split(','))
@@ -701,6 +760,10 @@ def config_to_fields(cfg: Config) -> list:
         t.experimental_data_file, t.snr_subsample_frames,
         # ── Generate Training Data — training NFP (z of best focus) — appended, keeps every index above stable ──
         nfp_training,
+        # ── Inference — appended, keeps every index above stable ────────────────
+        ir.training_data_dir, ir.checkpoint_path, ir.experimental_data_file, ir.output_dir,
+        ir.device, ir.threshold, ir.center_fraction, ir.save_chunk_frames,
+        ir.preview_frame_index, ir.live_viz_every_frames,
     ]
 
 
@@ -745,6 +808,10 @@ def fields_to_config(
     td_exp_data_file, td_snr_subsample_frames,
     # Generate Training Data — training NFP (1)
     td_nfp_training,
+    # Inference (10)
+    infer_training_data_dir, infer_checkpoint_path, infer_exp_data_file, infer_output_dir,
+    infer_device, infer_threshold, infer_center_fraction, infer_save_chunk_frames,
+    infer_preview_frame_index, infer_live_viz_every_frames,
 ) -> Config:
     """Parse ordered Gradio field values back into a Config object."""
     offaxis_files = [
@@ -830,6 +897,18 @@ def fields_to_config(
             torch_seed=int(float(train_torch_seed)),
             sample_viz_every_epochs=int(float(train_sample_viz_every)),
             viz_threshold=float(train_viz_threshold),
+        ),
+        inference_run=InferenceRunConfig(
+            training_data_dir=str(infer_training_data_dir).strip(),
+            checkpoint_path=str(infer_checkpoint_path).strip(),
+            experimental_data_file=str(infer_exp_data_file).strip(),
+            output_dir=str(infer_output_dir).strip(),
+            device=str(infer_device),
+            threshold=float(infer_threshold),
+            center_fraction=float(infer_center_fraction),
+            save_chunk_frames=int(float(infer_save_chunk_frames)),
+            preview_frame_index=int(float(infer_preview_frame_index)),
+            live_viz_every_frames=int(float(infer_live_viz_every_frames)),
         ),
     )
 
@@ -1249,6 +1328,66 @@ def build_demo() -> gr.Blocks:
                 )
                 train_log_out = gr.Textbox(label="Output Log", lines=15, interactive=False)
 
+            with gr.Tab("Inference"):
+                gr.Markdown("### 1. Load Training Data")
+                with gr.Row(equal_height=True):
+                    infer_load_td_btn = gr.Button("Load Training Data")
+                    infer_td_status = gr.Textbox(
+                        show_label=False, interactive=False,
+                        placeholder="Click to load x/, y.pickle, param.pickle from the training-data folder below.",
+                    )
+                infer_td_meta_state = gr.State(None)
+
+                gr.Markdown("### 2. Configure")
+                with gr.Group(elem_classes=["critical-config"]):
+                    with gr.Row(equal_height=True):
+                        infer_training_data_dir = gr.Textbox(
+                            label="Training data folder",
+                            value=defaults[81] or str(PROJECT_DIR / "training_data"),
+                        )
+                        infer_checkpoint_path = gr.Textbox(label="Checkpoint path", value=defaults[82])
+                    with gr.Row(equal_height=True):
+                        infer_exp_data_file = gr.Textbox(
+                            label="Experimental data file (path on the server hosting this GUI)",
+                            value=defaults[83],
+                        )
+                        infer_output_dir = gr.Textbox(
+                            label="Output folder",
+                            value=defaults[84] or str(PROJECT_DIR / "inference_results"),
+                        )
+                    with gr.Row(equal_height=True):
+                        infer_device = gr.Dropdown(
+                            label="Device", choices=["auto", "cpu"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())],
+                            value=defaults[85],
+                        )
+                        infer_threshold = gr.Number(label="Detection threshold", value=defaults[86])
+
+                with gr.Accordion("Advanced", open=False):
+                    with gr.Row(equal_height=True):
+                        infer_center_fraction = gr.Number(label="Tile center fraction", value=defaults[87])
+                        infer_save_chunk_frames = gr.Number(label="Save chunk (frames)", value=defaults[88], precision=0)
+                    with gr.Row(equal_height=True):
+                        infer_preview_frame_index = gr.Number(label="Preview page index", value=defaults[89], precision=0)
+                        infer_live_viz_every_frames = gr.Number(label="Live-debug cadence (frames)", value=defaults[90], precision=0)
+
+                infer_update_preview_btn = gr.Button("Update Preview")
+                infer_preview_plot = gr.Plot(show_label=False)
+                infer_preview_status = gr.Textbox(
+                    show_label=False, interactive=False, placeholder="Preview status appears here.",
+                )
+
+                with gr.Row(equal_height=True):
+                    infer_start_btn = gr.Button("Run Inference", variant="primary")
+                    infer_stop_btn = gr.Button("Stop", variant="stop", interactive=False)
+
+                gr.Markdown("**Live debug window**")
+                infer_live_plot = gr.Plot(show_label=False)
+                infer_summary = gr.Textbox(
+                    show_label=False, interactive=False,
+                    placeholder="CSV output paths appear here once inference finishes.",
+                )
+                infer_log_out = gr.Textbox(label="Output Log", lines=15, interactive=False)
+
         # component list — order MUST match config_to_fields / fields_to_config
         all_fields = [
             m_M, m_NA, m_n_imm, u_lamda, m_n_sample,
@@ -1279,6 +1418,9 @@ def build_demo() -> gr.Blocks:
             train_num_workers, train_numpy_seed, train_torch_seed, train_sample_viz_every, train_viz_threshold,
             td_exp_data_file, td_subsample_n,
             td_nfp_training,
+            infer_training_data_dir, infer_checkpoint_path, infer_exp_data_file, infer_output_dir,
+            infer_device, infer_threshold, infer_center_fraction, infer_save_chunk_frames,
+            infer_preview_frame_index, infer_live_viz_every_frames,
         ]
 
         # microscope preset fields, in the fixed order used by microscopes.json entries
@@ -1295,9 +1437,12 @@ def build_demo() -> gr.Blocks:
         # sys.stdout, so all three busy flags must be cross-checked by every one of the three
         # run-starting handlers (see the guards in run_handler, on_td_simulate, on_train_start).
         _train_run_state = {"stop_event": None, "busy": False}
+        # separate again for Inference -- same shared-sys.stdout hazard, so all four busy flags
+        # must be cross-checked by every one of the four run-starting handlers now.
+        _infer_run_state = {"stop_event": None, "busy": False}
         # Guards the check-then-claim sequence ("is anything busy? if not, claim my own busy
-        # flag") in every one of the three start handlers above. Without this, two near-
-        # simultaneous clicks on two different tabs could both see all three flags False before
+        # flag") in every one of the four start handlers above. Without this, two near-
+        # simultaneous clicks on two different tabs could both see all four flags False before
         # either claims its own, and both worker threads would redirect sys.stdout at once.
         _busy_lock = threading.Lock()
 
@@ -1691,7 +1836,8 @@ def build_demo() -> gr.Blocks:
             # redirect the process-global sys.stdout, which corrupts each other's log streams
             # (and each other's redirection) if they ever run at the same time.
             with _busy_lock:
-                if _run_state["busy"] or _td_run_state["busy"] or _train_run_state["busy"]:
+                if (_run_state["busy"] or _td_run_state["busy"] or _train_run_state["busy"]
+                        or _infer_run_state["busy"]):
                     busy_elsewhere = True
                 else:
                     _run_state["busy"] = True
@@ -2011,7 +2157,8 @@ def build_demo() -> gr.Blocks:
             # also blocks against a concurrent Run-tab phase retrieval — see the matching guard
             # in run_handler for why (shared sys.stdout redirection).
             with _busy_lock:
-                if _td_run_state["busy"] or _run_state["busy"] or _train_run_state["busy"]:
+                if (_td_run_state["busy"] or _run_state["busy"] or _train_run_state["busy"]
+                        or _infer_run_state["busy"]):
                     busy_elsewhere = True
                 else:
                     _td_run_state["busy"] = True
@@ -2105,7 +2252,8 @@ def build_demo() -> gr.Blocks:
 
         def on_train_start(td_meta, *vals):
             with _busy_lock:
-                if _train_run_state["busy"] or _run_state["busy"] or _td_run_state["busy"]:
+                if (_train_run_state["busy"] or _run_state["busy"] or _td_run_state["busy"]
+                        or _infer_run_state["busy"]):
                     busy_elsewhere = True
                 else:
                     _train_run_state["busy"] = True
@@ -2189,6 +2337,127 @@ def build_demo() -> gr.Blocks:
             if _train_run_state["stop_event"] is not None:
                 _train_run_state["stop_event"].set()
                 gr.Info("Stop requested — finishing the current epoch and saving a resumable checkpoint.", duration=6)
+            return gr.update(value="⏳ Stopping…", interactive=False)
+
+        # ── Inference tab handlers ──────────────────────────────────────────────
+
+        def on_infer_load_td(training_data_dir):
+            try:
+                meta = app_utils.load_training_data_metadata(str(training_data_dir))
+            except Exception as exc:
+                return None, f"[ERROR] Could not load training data: {exc}"
+            if meta is None:
+                return None, ("No training data found yet at this path — point this at a "
+                               "folder generate_training_data() has written to, or run "
+                               "Generate Training Data first.")
+            D, HH, WW = meta["labels"]["volume_size"]
+            return meta, f"Loaded. Volume size (D,H,W) = ({D},{HH},{WW})."
+
+        def on_infer_preview(td_meta, preview_frame_index, *vals):
+            if td_meta is None:
+                return None, "Load Training Data first."
+            try:
+                cfg = fields_to_config(*vals)
+                param_dict, inference_dict = cfg.generate_inference_dict(td_meta)
+            except Exception as exc:
+                return None, f"[CONFIG ERROR] {exc}"
+            try:
+                return app_utils.preview_inference_frame(param_dict, inference_dict, int(preview_frame_index))
+            except Exception as exc:
+                return None, f"[ERROR] {exc}"
+
+        def on_infer_start(td_meta, *vals):
+            with _busy_lock:
+                if (_infer_run_state["busy"] or _run_state["busy"] or _td_run_state["busy"]
+                        or _train_run_state["busy"]):
+                    busy_elsewhere = True
+                else:
+                    _infer_run_state["busy"] = True
+                    busy_elsewhere = False
+            if busy_elsewhere:
+                yield ("[ERROR] Another run (Phase Retrieval, Generate Training Data, or Train Model) "
+                       "is already in progress.", gr.skip(), gr.skip(),
+                       gr.skip(), gr.skip())
+                return
+            if td_meta is None:
+                _infer_run_state["busy"] = False
+                yield ("[ERROR] Load Training Data first.", gr.skip(), gr.skip(),
+                       gr.update(interactive=True), gr.update(interactive=False))
+                return
+            try:
+                cfg = fields_to_config(*vals)
+                param_dict, inference_dict = cfg.generate_inference_dict(td_meta)
+            except Exception as exc:
+                _infer_run_state["busy"] = False
+                yield (f"[CONFIG ERROR] {exc}", gr.skip(), gr.skip(),
+                       gr.update(interactive=True), gr.update(interactive=False))
+                return
+
+            q: queue.SimpleQueue = queue.SimpleQueue()
+            old_stdout = sys.stdout
+            sys.stdout = _StreamToQueue(q)
+            done_evt = threading.Event()
+            run_error: list = [None]
+            result: list = [None]
+            live_box: dict = {}
+            stop_event = threading.Event()
+            _infer_run_state["stop_event"] = stop_event
+
+            def _worker():
+                try:
+                    result[0] = app_utils.run_inference(param_dict, inference_dict, live_box=live_box, stop_event=stop_event)
+                except Exception as exc:
+                    q.put(f"\n[EXCEPTION] {exc}\n")
+                    run_error[0] = exc
+                finally:
+                    sys.stdout = old_stdout
+                    _infer_run_state["busy"] = False
+                    done_evt.set()
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+            log = ""
+            last_seen_version = 0
+            while True:
+                try:
+                    chunk = q.get(timeout=0.2)
+                    log += chunk
+                except queue.Empty:
+                    if done_evt.is_set():
+                        break
+
+                version = live_box.get("version", 0)
+                if version != last_seen_version:
+                    last_seen_version = version
+                    plot_update = _build_inference_live_figure(live_box)
+                else:
+                    plot_update = gr.skip()
+                stop_btn_update = gr.skip() if stop_event.is_set() else gr.update(interactive=True)
+                yield log, plot_update, gr.skip(), gr.update(interactive=False), stop_btn_update
+
+            while not q.empty():
+                log += q.get_nowait()
+
+            version = live_box.get("version", 0)
+            plot_update = _build_inference_live_figure(live_box) if version != last_seen_version else gr.skip()
+
+            _infer_run_state["stop_event"] = None
+            log += "\n\n--- DONE ---" if run_error[0] is None else f"\n\n--- FAILED: {run_error[0]} ---"
+            if result[0] is not None:
+                r = result[0]
+                summary = (f"{r['total_detections']} detection(s) across {r['total_frames']} "
+                           f"frame(s) in {r['elapsed_s']:.1f}s"
+                           f"{' (stopped early)' if r['stopped_early'] else ''}. "
+                           f"CSV: {', '.join(r['csv_files']) if r['csv_files'] else '(none written)'}")
+            else:
+                summary = gr.skip()
+            yield (log, plot_update, summary,
+                   gr.update(interactive=True), gr.update(value="Stop", interactive=False))
+
+        def on_infer_stop():
+            if _infer_run_state["stop_event"] is not None:
+                _infer_run_state["stop_event"].set()
+                gr.Info("Stop requested — finishing the current frame and flushing buffered detections.", duration=6)
             return gr.update(value="⏳ Stopping…", interactive=False)
 
         load_file.change(fn=load_handler, inputs=load_file, outputs=all_fields)
@@ -2324,6 +2593,21 @@ def build_demo() -> gr.Blocks:
             outputs=[train_log_out, train_live_plot, train_summary, train_start_btn, train_stop_btn],
         )
         train_stop_btn.click(fn=on_train_stop, outputs=train_stop_btn)
+
+        # Inference's experimental-data-file field auto-populates from Generate Training
+        # Data's own field, so the path doesn't need retyping between tabs -- still a plain
+        # editable Textbox the user can override by hand at any time.
+        td_exp_data_file.change(fn=lambda v: v, inputs=[td_exp_data_file], outputs=[infer_exp_data_file])
+        infer_load_td_btn.click(fn=on_infer_load_td, inputs=[infer_training_data_dir], outputs=[infer_td_meta_state, infer_td_status])
+        infer_update_preview_btn.click(
+            fn=on_infer_preview, inputs=[infer_td_meta_state, infer_preview_frame_index] + all_fields,
+            outputs=[infer_preview_plot, infer_preview_status],
+        )
+        infer_start_btn.click(
+            fn=on_infer_start, inputs=[infer_td_meta_state] + all_fields,
+            outputs=[infer_log_out, infer_live_plot, infer_summary, infer_start_btn, infer_stop_btn],
+        )
+        infer_stop_btn.click(fn=on_infer_stop, outputs=infer_stop_btn)
 
         demo.load(None, None, None, js=SETUP_CROP_CURSOR_JS)
 

@@ -136,11 +136,29 @@ class TrainingRunConfig:
 
 
 @dataclass
+class InferenceRunConfig:
+    training_data_dir: str = ""
+    checkpoint_path: str = ""
+    experimental_data_file: str = ""   # one multi-page TIFF -- same file Generate Training
+                                        # Data samples from
+    output_dir: str = ""               # GUI default set at build time: PROJECT_DIR / "inference_results"
+    device: str = "auto"               # "auto" | "cpu" | "cuda:N"
+    threshold: float = 20.0            # Volume2XYZ decode threshold -- load-bearing here for
+                                        # both detection and the self-consistency loss's re-render
+    center_fraction: float = 0.75      # root's hardcoded tiling default, never exposed in root's GUI
+    save_chunk_frames: int = 5000
+    preview_frame_index: int = 0
+    live_viz_every_frames: int = 20    # shared cadence for the self-consistency loss point and
+                                        # the rolling overlay panels
+
+
+@dataclass
 class Config:
     user: UserConfig = field(default_factory=UserConfig)
     advanced: AdvancedConfig = field(default_factory=AdvancedConfig)
     training: TrainingDataConfig = field(default_factory=TrainingDataConfig)
     training_run: TrainingRunConfig = field(default_factory=TrainingRunConfig)
+    inference_run: InferenceRunConfig = field(default_factory=InferenceRunConfig)
 
     def generate_param_dict(self) -> dict:
         """
@@ -261,6 +279,27 @@ class Config:
         )
         return param_dict, training_dict
 
+    def generate_inference_dict(self, td_metadata: dict) -> tuple[dict, dict]:
+        """
+        td_metadata: the dict returned by app_utils.load_training_data_metadata(), i.e.
+        {'param_dict': <param.pickle contents>, 'labels': <y.pickle contents>} -- the
+        checkpoint itself carries no physics metadata, only net/state_dict/resume bookkeeping.
+        Returns (param_dict, inference_dict), mirroring generate_training_run_dict's shape.
+        """
+        from DS3Dplus.ds3d_utils import select_device
+
+        r = self.inference_run
+        param_dict = dict(td_metadata['param_dict'])   # copy -- never mutate the cached metadata
+        param_dict['device'] = select_device() if r.device == "auto" else r.device
+        param_dict['threshold'] = r.threshold
+        inference_dict = dict(
+            checkpoint_path=r.checkpoint_path, experimental_data_file=r.experimental_data_file,
+            output_dir=r.output_dir, center_fraction=r.center_fraction,
+            save_chunk_frames=r.save_chunk_frames, preview_frame_index=r.preview_frame_index,
+            live_viz_every_frames=r.live_viz_every_frames,
+        )
+        return param_dict, inference_dict
+
     def generate_pr_dict(self) -> dict:
         """
         Phase retrieval training configuration consumed only by phase_retrieval().
@@ -297,15 +336,18 @@ class Config:
         adv_fields = {f.name for f in dataclass_fields(AdvancedConfig) if f.init}
         training_fields = {f.name for f in dataclass_fields(TrainingDataConfig) if f.init}
         training_run_fields = {f.name for f in dataclass_fields(TrainingRunConfig) if f.init}
+        inference_run_fields = {f.name for f in dataclass_fields(InferenceRunConfig) if f.init}
         user_kwargs = {k: v for k, v in d['user'].items() if k in user_fields}
         adv_kwargs = {k: v for k, v in d['advanced'].items() if k in adv_fields}
         training_kwargs = {k: v for k, v in d.get('training', {}).items() if k in training_fields}
         training_run_kwargs = {k: v for k, v in d.get('training_run', {}).items() if k in training_run_fields}
+        inference_run_kwargs = {k: v for k, v in d.get('inference_run', {}).items() if k in inference_run_fields}
         return cls(
             user=UserConfig(**user_kwargs),
             advanced=AdvancedConfig(**adv_kwargs),
             training=TrainingDataConfig(**training_kwargs),
             training_run=TrainingRunConfig(**training_run_kwargs),
+            inference_run=InferenceRunConfig(**inference_run_kwargs),
         )
 
     def save(self, path: str):
