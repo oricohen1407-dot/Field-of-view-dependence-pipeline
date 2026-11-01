@@ -1,10 +1,24 @@
 import torch
 import os
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import math
 import torch.nn.functional as F
 from DS3Dplus.ds3d_utils import asm_propagate
+
+
+def simulation_grid_size(f_4f, lamda, ps_camera, ps_BFP) -> int:
+    N = np.floor(f_4f * lamda / (ps_camera * ps_BFP))
+    return int(N + 1 - (N % 2))
+
+
+def _logit_init(x_init, lo, hi, eps=1e-3):
+    """Map an initial value into an unconstrained logit parameter, bounded to [lo, hi]."""
+    p = (x_init - lo) / (hi - lo + 1e-12)
+    p = min(max(p, eps), 1.0 - eps)
+    return math.log(p / (1.0 - p))
+
 
 class ImModel_pr(torch.nn.Module):
     def __init__(self, params):
@@ -25,11 +39,9 @@ class ImModel_pr(torch.nn.Module):
         # ---- learnable d (mask displacement) ----
         self.d_min_um = params["d_min_um"]
         self.d_max_um = params["d_max_um"]
-        d_init = params.get("mask_offset_in_um", 0.5 * (self.d_min_um + self.d_max_um))
+        d_init = params["mask_offset_in_um"]
 
         self.centralBeadCoordinates_pixel = list(params['centralBeadCoordinates_pixel'])
-        self.NFP = params['NFP']  # location of the nominal focal plane
-
 
         # map initial d into an unconstrained parameter via inverse-sigmoid (logit)
         eps = 1e-3
@@ -38,14 +50,27 @@ class ImModel_pr(torch.nn.Module):
         d_raw_init = math.log(p / (1.0 - p))
 
         self.d_raw = torch.nn.Parameter(torch.tensor(d_raw_init, device=self.device, dtype=torch.float32))
+
+        # ---- learnable NFP center offset (range length is fixed, not fitted) ----
+        self.nfp_range_um = float(params["nfp_range_um"])
+        if self.nfp_range_um <= 0:
+            raise ValueError(f"nfp_range_um must be positive; got {self.nfp_range_um}")
+        self.nfp_offset_min_um = params["nfp_offset_min_um"]
+        self.nfp_offset_max_um = params["nfp_offset_max_um"]
+        self.Z = int(params["Z"])
+        if self.Z < 2:
+            raise ValueError(f"ImModel_pr requires Z >= 2 to fit an NFP sweep; got Z={self.Z}")
+
+        nfp_offset_init = params["nfp_offset_init_um"]
+        nfp_offset_raw_init = _logit_init(nfp_offset_init, self.nfp_offset_min_um, self.nfp_offset_max_um)
+        self.nfp_offset_raw = torch.nn.Parameter(torch.tensor(nfp_offset_raw_init, device=self.device, dtype=torch.float32))
         # image
         H, W = params['H'], params['W']  # FOV size
         g_size = 9  # size of the gaussian blur kernel
         g_sigma = params['g_sigma']  # std of the gaussian blur kernel
         ###################
 
-        N = np.floor(self.f_4f * self.lamda / (self.ps_camera * self.ps_BFP))  # simulation size
-        N = int(N + 1 - (N % 2))  # make it odd
+        N = simulation_grid_size(self.f_4f, self.lamda, self.ps_camera, self.ps_BFP)
         print(f'Simulation size of the imaging model is {N} which must be larger than image size (PSF z-stack and training images)!')
 
         # pupil/aperture at back focal plane
@@ -124,12 +149,17 @@ class ImModel_pr(torch.nn.Module):
         # DEBUG: BFP logging  #27/01/2026
         # -------------------------
         self.debug_bfp = bool(params.get("debug_bfp", True))  # hard-code True if you want
-        self.debug_every = int(params.get("debug_every", 500//2))  # every N forward calls
+        self.debug_every_num_epoch = int(params.get("debug_every_num_epoch", 10))  # every N epochs
         self.debug_dir = str(params.get("debug_dir", os.path.join("debug", "bfp")))
         self.debug_max_emitters = int(params.get("debug_max_emitters", 5 ))  # save first K in batch  number of beads
-        self._debug_call_idx = 0
-        #self.phase_mask = torch.tensor(circ, device=device, requires_grad=True)
-        self.phase_mask = torch.zeros((N, N), device=self.device, requires_grad=True)
+        self.current_epoch = 0  # set by the caller (app_utils.py) before each epoch's forward calls
+        self._last_debug_epoch = None  # guards against dumping more than once per qualifying epoch
+        self.debug_save_time_s = 0.0  # cumulative wall-clock time spent inside _maybe_save_debug
+        phase_mask_init = params.get('phase_mask_init')
+        if phase_mask_init is not None:
+            self.phase_mask = torch.tensor(phase_mask_init, device=self.device, dtype=torch.float32, requires_grad=True)
+        else:
+            self.phase_mask = torch.zeros((N, N), device=self.device, requires_grad=True)
 
         self.g_sigma = torch.tensor(g_sigma, device=self.device, requires_grad=True)
 
@@ -138,13 +168,29 @@ class ImModel_pr(torch.nn.Module):
         # bounded to [d_min_um, d_max_um]
         return self.d_min_um + (self.d_max_um - self.d_min_um) * torch.sigmoid(self.d_raw)
 
-    def _maybe_save_debug(self, ef_bfp_eff, psfs, xyzps, NFPs):
+    def nfp_offset_um(self):
+        return self.nfp_offset_min_um + (self.nfp_offset_max_um - self.nfp_offset_min_um) * torch.sigmoid(self.nfp_offset_raw)
+
+    def nfps(self, zi=None):
+        """Per-slice NFP sweep, fixed-length window centered on nfp_offset_um().
+        zi: slice indices in [0, Z-1]; default arange(Z)."""
+        center = self.nfp_offset_um()
+        start = center - self.nfp_range_um / 2
+        step = self.nfp_range_um / (self.Z - 1)
+        if zi is None:
+            zi = torch.arange(self.Z, device=self.device, dtype=start.dtype)
+        else:
+            zi = zi.to(dtype=start.dtype)
+        return start + step * zi
+
+    def _maybe_save_debug(self, ef_bfp_eff, psfs, xyzps, NFPs, targets=None):
         if not self.debug_bfp:
             return
-
-        self._debug_call_idx += 1
-        if (self._debug_call_idx % self.debug_every) != 0:
+        if (self.current_epoch % self.debug_every_num_epoch) != 0:
             return
+        if self._last_debug_epoch == self.current_epoch:
+            return  # already dumped this epoch — forward() runs many times per epoch
+        self._last_debug_epoch = self.current_epoch
 
         os.makedirs(self.debug_dir, exist_ok=True)
 
@@ -180,37 +226,49 @@ class ImModel_pr(torch.nn.Module):
             psf = psfs[inx].detach().cpu().numpy()
             psf_disp = psf / (psf.max() + 1e-12)
 
+            # experimental (ground-truth) PSF this prediction is trying to match, if available
+            target_disp = None
+            if targets is not None and inx < targets.shape[0]:
+                target = targets[inx].detach().cpu().numpy()
+                target_disp = target / (target.max() + 1e-12)
+
             # xyz + nfp for title
             x_um = float(xyzps[inx, 0].detach().cpu().item())
             y_um = float(xyzps[inx, 1].detach().cpu().item())
             z_um = float(xyzps[inx, 2].detach().cpu().item())
             nfp = float(NFPs[inx].detach().cpu().item()) if NFPs is not None else float("nan")
 
-            fig = plt.figure(figsize=(10, 4))
+            n_panels = 3 if target_disp is not None else 2
+            fig = plt.figure(figsize=(15 if n_panels == 3 else 10, 4), constrained_layout=True)
 
-            ax1 = fig.add_subplot(1, 2, 1)
+            ax1 = fig.add_subplot(1, n_panels, 1)
             im1 = ax1.imshow(phase_eff, cmap="twilight")
             ax1.set_title("effective BFP phase")
             ax1.axis("off")
             fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
-            ax2 = fig.add_subplot(1, 2, 2)
+            ax2 = fig.add_subplot(1, n_panels, 2)
             im2 = ax2.imshow(psf_disp, cmap="gray")
             ax2.set_title("PSF (display norm)")
             ax2.axis("off")
             fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
+            if target_disp is not None:
+                ax3 = fig.add_subplot(1, n_panels, 3)
+                im3 = ax3.imshow(target_disp, cmap="gray")
+                ax3.set_title("experimental PSF (target)")
+                ax3.axis("off")
+                fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
             fig.suptitle(
-                f"call={self._debug_call_idx}  d={d_now:.1f}um  g={g_now:.3f}  "
+                f"epoch={self.current_epoch}  d={d_now:.1f}um  g={g_now:.3f}  "
                 f"x={x_um:.3f} y={y_um:.3f} z={z_um:.3f}  NFP={nfp:.3f}"
             )
-            fig.tight_layout()
-
-            out = os.path.join(subdir, f"call_{self._debug_call_idx:06d}.png")
+            out = os.path.join(subdir, f"epoch_{self.current_epoch:06d}.png")
             fig.savefig(out, dpi=200, bbox_inches="tight")
             plt.close(fig)
 
-    def forward(self, xyzps, NFPs):
+    def forward(self, xyzps, NFPs, targets=None):
 
         def shift2d_integer(img2d: torch.Tensor, shift_x_px: int, shift_y_px: int):
             """
@@ -306,6 +364,7 @@ class ImModel_pr(torch.nn.Module):
 
         dx_mask_px = torch.round(dx_mask_px).to(torch.int64)
         dy_mask_px = torch.round(dy_mask_px).to(torch.int64)
+        self.last_mask_shift_px = torch.stack([dx_mask_px, dy_mask_px], dim=1).detach()  # [B,2]
         # -----------------------------------
         # shift complex field at mask plane
         ef_mask_shifted = []
@@ -321,6 +380,7 @@ class ImModel_pr(torch.nn.Module):
 
         ef_mask_shifted = ef_mask_shifted * phase * circ_phase
         ef_mask_shifted = torch.where(circ_phase > 0.5, ef_mask_shifted, 0)
+        self.last_mask_plane_phase = torch.angle(ef_mask_shifted).detach()
 
         # -----------------------------------
         # shift back
@@ -338,6 +398,7 @@ class ImModel_pr(torch.nn.Module):
             ef_bfp_after = ef_mask_unshifted
 
         ef_bfp_after = torch.where(circ_final_bfp > 0.5, ef_bfp_after, 0)
+        self.last_ef_bfp_phase = torch.angle(ef_bfp_after).detach()
 
         # -----------------------------------
         # image plane FFT
@@ -364,6 +425,8 @@ class ImModel_pr(torch.nn.Module):
 
         # debug
         if self.debug_bfp:
-            self._maybe_save_debug(ef_bfp_after, psfs, xyzps, NFPs)
+            _debug_t0 = time.perf_counter()
+            self._maybe_save_debug(ef_bfp_after, psfs, xyzps, NFPs, targets)
+            self.debug_save_time_s += time.perf_counter() - _debug_t0
 
         return psfs

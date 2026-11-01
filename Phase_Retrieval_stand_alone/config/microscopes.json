@@ -1,0 +1,12 @@
+{
+  "Default": {
+    "M": 100,
+    "NA": 1.45,
+    "n_immersion": 1.518,
+    "f_4f": 200000,
+    "ps_camera": 11,
+    "ps_BFP": 80,
+    "n_sample": 1.33,
+    "bitdepth": 16
+  }
+}
